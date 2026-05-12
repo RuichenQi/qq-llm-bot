@@ -20,6 +20,9 @@ def _event(text: str, *, user_id: int = 42, reply_id: str | None = None,
     segs: list = []
     if reply_id is not None:
         segs.append({"type": "reply", "data": {"id": reply_id}})
+    # Commands now require @bot — add it automatically for test ergonomics.
+    if text.startswith("/"):
+        segs.append({"type": "at", "data": {"qq": "10000"}})
     if text:
         segs.append({"type": "text", "data": {"text": text}})
     if image_url:
@@ -66,7 +69,7 @@ def _make_handler(monkeypatch, *, stream_chunks=None, fetch_reply=None) -> Tuple
 
     stub_router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image):
+    async def decide(text, *, has_image, was_at_bot=False):
         from bot.router import RouteDecision
         return RouteDecision("deepseek_chat", 1.0, "stub", text)
 
@@ -81,7 +84,7 @@ def _make_handler(monkeypatch, *, stream_chunks=None, fetch_reply=None) -> Tuple
         rate=RateLimiter(per_minute=999),
         send_text=send_text,
         send_image=send_image,
-        fetch_reply_text=fetch_reply,
+        fetch_reply=fetch_reply,
     )
     return handler, sent
 
@@ -92,32 +95,8 @@ def patch_allowed(monkeypatch):
     monkeypatch.setattr(cfg.CONFIG, "trigger_mode", "always", raising=False)
 
 
-def test_streaming_flushes_at_threshold(monkeypatch):
-    monkeypatch.setattr(cfg.CONFIG, "stream_replies", True, raising=False)
-    monkeypatch.setattr(cfg.CONFIG, "stream_flush_chars", 3, raising=False)
-    # 9 chars total → expect 3 flushes of size 3 each
-    handler, sent = _make_handler(monkeypatch, stream_chunks=["123", "456", "789"])
-    parsed = parse_event(_event("hi"))
-    asyncio.run(handler.handle(parsed))
-    asyncio.run(handler.aclose())
-    texts = [t for _, t in sent]
-    assert texts == ["123", "456", "789"]
-
-
-def test_streaming_flushes_on_paragraph(monkeypatch):
-    monkeypatch.setattr(cfg.CONFIG, "stream_replies", True, raising=False)
-    monkeypatch.setattr(cfg.CONFIG, "stream_flush_chars", 9999, raising=False)
-    handler, sent = _make_handler(monkeypatch, stream_chunks=["para1", "\n\n", "para2"])
-    parsed = parse_event(_event("hi"))
-    asyncio.run(handler.handle(parsed))
-    asyncio.run(handler.aclose())
-    texts = [t for _, t in sent]
-    assert texts[0] == "para1"
-    assert "para2" in texts[1]
-
-
-def test_streaming_disabled_falls_back_to_chat(monkeypatch):
-    monkeypatch.setattr(cfg.CONFIG, "stream_replies", False, raising=False)
+def test_chat_replies_in_one_call(monkeypatch):
+    """Plain LLM reply goes through `provider.chat` (no streaming anymore)."""
     handler, sent = _make_handler(monkeypatch)
     parsed = parse_event(_event("hi"))
     asyncio.run(handler.handle(parsed))
@@ -136,20 +115,60 @@ def test_reply_segment_prepends_quoted_text(monkeypatch):
         return TextReply(text="ok", model="stub")
 
     handler, _ = _make_handler(monkeypatch)
-    # swap chat to capture
     handler.deepseek.chat = stub_chat
+
+    from bot.message_parser import QuotedMessage
 
     async def fetch(mid):
         assert mid == "xyz"
-        return "之前那个柴犬的图"
+        return QuotedMessage(text="之前那个柴犬的图")
 
-    handler.fetch_reply_text = fetch
+    handler.fetch_reply = fetch
     parsed = parse_event(_event("更可爱一点", reply_id="xyz"))
     asyncio.run(handler.handle(parsed))
     asyncio.run(handler.aclose())
     assert seen_messages, "expected chat() to be called"
     assert "之前那个柴犬的图" in seen_messages[0]
     assert "更可爱一点" in seen_messages[0]
+
+
+def test_reply_segment_pulls_in_quoted_image(monkeypatch):
+    """If user @-replies to a friend's image with a question, the bot should
+    see that image as if the current user had attached it."""
+    monkeypatch.setattr(cfg.CONFIG, "stream_replies", False, raising=False)
+    handler, sent = _make_handler(monkeypatch)
+
+    from bot.message_parser import QuotedMessage
+
+    async def fetch(mid):
+        return QuotedMessage(text="", image_urls=["https://example.com/friend.png"])
+
+    handler.fetch_reply = fetch
+
+    captured_image_urls: list[str] = []
+
+    async def stub_download(url):
+        captured_image_urls.append(url)
+        return b"\x89PNG\x00stub"
+
+    handler._download = stub_download
+
+    parsed = parse_event(_event("这是啥", reply_id="abc"))
+    asyncio.run(handler.handle(parsed))
+    # Let the eager-cache create_task finish so we can assert on side effects
+    async def _settle():
+        await asyncio.sleep(0)
+        for _ in range(20):
+            if captured_image_urls:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_settle())
+    asyncio.run(handler.aclose())
+
+    assert captured_image_urls == ["https://example.com/friend.png"], (
+        f"expected the bot to fetch the quoted image, got {captured_image_urls}"
+    )
 
 
 def test_admin_blocks_non_superuser(monkeypatch):

@@ -26,6 +26,9 @@ def _png(size, colour=(0, 200, 30)) -> bytes:
 
 def _event(text: str, image_url: str | None = None, user_id: int = 42):
     segs: list = []
+    # Commands now require @bot.
+    if text.startswith("/"):
+        segs.append({"type": "at", "data": {"qq": "10000"}})
     if image_url:
         segs.append({"type": "image", "data": {"url": image_url}})
     if text:

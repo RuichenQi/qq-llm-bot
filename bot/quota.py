@@ -15,6 +15,8 @@ ROUTE_GROUP_LIMITS = {
     "openai_image": "openai_image_group",
     "openai_image_edit": "openai_image_edit_group",
     "openai_vision": "openai_vision_group",
+    # auto_vision is group-only (no per-user limit) — background captioning.
+    "auto_vision": "auto_vision_group",
 }
 ROUTE_USER_LIMITS = {
     "openai_text": "openai_text_user",

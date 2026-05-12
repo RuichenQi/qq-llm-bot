@@ -82,7 +82,12 @@ class OpenAIProvider:
     ) -> TextReply:
         content: List[Dict[str, Any]] = [{"type": "text", "text": question or "请描述这张图片"}]
         for u in image_urls:
-            content.append({"type": "image_url", "image_url": {"url": u}})
+            # detail=low locks the flat 85-token price. With our 512px max
+            # input that's enough resolution for OCR + general description.
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": u, "detail": "low"},
+            })
 
         body: Dict[str, Any] = {
             "model": CONFIG.openai_vision_model,

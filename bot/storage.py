@@ -55,6 +55,29 @@ CREATE TABLE IF NOT EXISTS groups (
 CREATE TABLE IF NOT EXISTS daily_report (
     day TEXT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS group_memory (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id  INTEGER NOT NULL,
+    ts        REAL NOT NULL,
+    user_id   INTEGER NOT NULL,
+    nickname  TEXT NOT NULL,
+    text      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS group_memory_by_group_ts
+    ON group_memory(group_id, ts);
+
+-- Long-term memory: one row per (group, day) holding an LLM-summarised
+-- recap of that day's conversation. Kept for up to a year.
+CREATE TABLE IF NOT EXISTS daily_recaps (
+    group_id   INTEGER NOT NULL,
+    day        TEXT NOT NULL,            -- "YYYY-MM-DD" local date
+    summary    TEXT NOT NULL,
+    created_at TEXT NOT NULL,            -- ISO timestamp
+    PRIMARY KEY (group_id, day)
+);
+CREATE INDEX IF NOT EXISTS daily_recaps_by_group_day
+    ON daily_recaps(group_id, day);
 """
 
 
@@ -62,6 +85,9 @@ class Storage:
     """Singleton-like async storage wrapper."""
 
     _instance: "Storage | None" = None
+    # Lazy asyncio.Lock — created on first `get()` call so it's bound to the
+    # current event loop. Reset alongside `_instance` between tests.
+    _init_lock: Optional[asyncio.Lock] = None
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -70,9 +96,18 @@ class Storage:
 
     @classmethod
     async def get(cls) -> "Storage":
-        if cls._instance is None:
-            cls._instance = Storage(DB_FILE)
-            await cls._instance._init()
+        # Fast path: fully initialized.
+        if cls._instance is not None and cls._instance._conn is not None:
+            return cls._instance
+        # Slow path: serialize concurrent first-callers so we don't open two
+        # connections or hand back a half-initialised instance.
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+        async with cls._init_lock:
+            if cls._instance is None:
+                cls._instance = Storage(DB_FILE)
+            if cls._instance._conn is None:
+                await cls._instance._init()
         return cls._instance
 
     @classmethod
@@ -80,6 +115,7 @@ class Storage:
         if cls._instance is not None:
             await cls._instance.close()
         cls._instance = Storage(path)
+        cls._init_lock = None
         await cls._instance._init(migrate=False)
         return cls._instance
 
@@ -269,6 +305,128 @@ class Storage:
             )
             await self._conn.commit()
             return (cur.rowcount or 0) > 0
+
+    # ---------- group memory ----------
+    async def group_memory_append(
+        self,
+        group_id: int,
+        ts: float,
+        user_id: int,
+        nickname: str,
+        text: str,
+        max_rows: int,
+    ) -> int:
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT INTO group_memory(group_id,ts,user_id,nickname,text)"
+                " VALUES(?,?,?,?,?)",
+                (group_id, ts, user_id, nickname, text),
+            )
+            rowid = cur.lastrowid
+            # Prune oldest rows over the per-group cap.
+            await self._conn.execute(
+                "DELETE FROM group_memory WHERE group_id=? AND id NOT IN ("
+                "  SELECT id FROM group_memory WHERE group_id=? "
+                "  ORDER BY ts DESC LIMIT ?)",
+                (group_id, group_id, max_rows),
+            )
+            await self._conn.commit()
+            return int(rowid or 0)
+
+    async def group_memory_update_text(self, row_id: int, new_text: str) -> None:
+        assert self._conn is not None
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE group_memory SET text=? WHERE id=?", (new_text, row_id),
+            )
+            await self._conn.commit()
+
+    async def group_memory_recent(
+        self, group_id: int, limit: int
+    ) -> List[Tuple[float, int, str, str]]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT ts,user_id,nickname,text FROM group_memory "
+            "WHERE group_id=? ORDER BY ts DESC LIMIT ?",
+            (group_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(float(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in reversed(rows)]
+
+    async def group_memory_since(
+        self, group_id: int, since_ts: float
+    ) -> List[Tuple[float, int, str, str]]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT ts,user_id,nickname,text FROM group_memory "
+            "WHERE group_id=? AND ts>=? ORDER BY ts ASC",
+            (group_id, since_ts),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(float(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+    # ---------- daily recaps (long-term memory) ----------
+    async def daily_recap_upsert(
+        self, group_id: int, day: str, summary: str
+    ) -> None:
+        assert self._conn is not None
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO daily_recaps(group_id,day,summary,created_at) "
+                "VALUES(?,?,?, datetime('now')) "
+                "ON CONFLICT(group_id, day) DO UPDATE SET "
+                "  summary=excluded.summary, created_at=excluded.created_at",
+                (group_id, day, summary[:2000]),
+            )
+            await self._conn.commit()
+
+    async def daily_recap_get(self, group_id: int, day: str) -> Optional[str]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT summary FROM daily_recaps WHERE group_id=? AND day=?",
+            (group_id, day),
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def daily_recap_recent(
+        self, group_id: int, limit: int
+    ) -> List[Tuple[str, str]]:
+        """Return [(day, summary), ...] most-recent first."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT day, summary FROM daily_recaps WHERE group_id=? "
+            "ORDER BY day DESC LIMIT ?",
+            (group_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(str(r[0]), str(r[1])) for r in rows]
+
+    async def daily_recap_search(
+        self, group_id: int, keyword: str, limit: int = 5
+    ) -> List[Tuple[str, str]]:
+        assert self._conn is not None
+        pattern = f"%{keyword}%"
+        async with self._conn.execute(
+            "SELECT day, summary FROM daily_recaps WHERE group_id=? "
+            "AND summary LIKE ? ORDER BY day DESC LIMIT ?",
+            (group_id, pattern, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(str(r[0]), str(r[1])) for r in rows]
+
+    async def daily_recap_prune(self, keep_days: int) -> int:
+        """Drop recaps older than `keep_days`. Returns rows deleted."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM daily_recaps "
+                "WHERE day < date('now', ?)",
+                (f"-{keep_days} days",),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
 
     # ---------- daily report bookkeeping ----------
     async def report_mark_sent(self, day: str) -> bool:

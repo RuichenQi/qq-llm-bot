@@ -26,3 +26,12 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# Third-party binaries (NapCat / QQ NT) — install locally, don't commit
+NapCat.Shell.*/
+NapCat.*.Shell/
+NapCat.Framework*/
+napcat/
+*.exe
+*.dll
+*.deb

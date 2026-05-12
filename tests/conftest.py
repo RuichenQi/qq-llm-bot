@@ -27,6 +27,12 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_mod, "QUOTA_FILE", quo_file)
     monkeypatch.setattr(ch_mod, "IMAGE_DIR", image_dir)
 
+    # Disable human-send delays in unit tests by default — tests that care
+    # can re-enable it explicitly.
+    monkeypatch.setattr(cfg.CONFIG, "human_send_enabled", False, raising=False)
+
     Storage._instance = None  # type: ignore[attr-defined]
+    Storage._init_lock = None  # type: ignore[attr-defined]
     yield
     Storage._instance = None  # type: ignore[attr-defined]
+    Storage._init_lock = None  # type: ignore[attr-defined]

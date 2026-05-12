@@ -65,7 +65,7 @@ def _make_handler(monkeypatch) -> Tuple[Handler, List[Tuple[int, str]]]:
 
     stub_router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image):
+    async def decide(text, *, has_image, was_at_bot=False):
         from bot.router import RouteDecision
         return RouteDecision("deepseek_chat", 1.0, "stub", text)
 
@@ -133,10 +133,21 @@ def test_trigger_prefix_blocks_unprefixed(monkeypatch, patched):
     assert sent == []
 
 
-def test_command_always_passes(monkeypatch, patched):
-    monkeypatch.setattr(cfg.CONFIG, "trigger_mode", "mention", raising=False)
+def test_command_without_at_is_ignored(monkeypatch, patched):
+    """Commands now require @bot too — bare /help in the group is silenced."""
+    monkeypatch.setattr(cfg.CONFIG, "trigger_mode", "always", raising=False)
     handler, sent = _make_handler(monkeypatch)
     parsed = parse_event(_event("/help"))
+    asyncio.run(handler.handle(parsed))
+    asyncio.run(handler.aclose())
+    assert sent == []
+
+
+def test_command_with_at_bot_passes(monkeypatch, patched):
+    """`@bot /help` should fire the command."""
+    monkeypatch.setattr(cfg.CONFIG, "trigger_mode", "always", raising=False)
+    handler, sent = _make_handler(monkeypatch)
+    parsed = parse_event(_event("/help", at=[10000]))
     asyncio.run(handler.handle(parsed))
     asyncio.run(handler.aclose())
     assert sent and "/ask" in sent[0][1]

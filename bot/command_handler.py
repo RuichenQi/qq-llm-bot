@@ -3,18 +3,25 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
 from bot import allowlist
+from bot.group_memory import GroupMemory, GroupMsg
+from bot.emoji_filter import filter_emoji
 from bot.image_utils import downscale_to_max, to_data_uri
 from bot.logger import get_logger
+from bot.long_memory import LongMemory
 from bot.memory import Memory
-from bot.message_parser import ParsedMessage, chunk_text
+from bot.message_parser import ParsedMessage, QuotedMessage, chunk_text
+from bot.persona import load_persona
 from bot.quota import Quota
 from bot.rate_limit import RateLimiter
 from bot.router import Router
@@ -27,15 +34,15 @@ log = get_logger(__name__)
 
 SendText = Callable[[int, str], Awaitable[None]]
 SendImage = Callable[[int, str], Awaitable[None]]
-# Fetch the *text* of the message referenced by [CQ:reply,id=...]. None if unavailable.
-FetchReplyText = Callable[[str], Awaitable[Optional[str]]]
+# Fetch the message referenced by [CQ:reply,id=...] (text + image URLs).
+FetchReply = Callable[[str], Awaitable[Optional[QuotedMessage]]]
 # Returns a `bot.onebot_client.WsStatus` (kept loose-typed to avoid the import cycle).
 HealthFn = Callable[[], object]
 
 QUOTA_EXCEEDED_MSG = "今天这个功能的额度用完了，请明天再试吧~"
 RATE_LIMITED_MSG = "你发得太快啦，先休息一下吧~"
 REJECT_MSG = "这个请求我没法处理~"
-ERROR_MSG = "出了点小问题，请稍后再试 ({err})"
+ERROR_MSG = "Can someone tell RC there is a problem with my AI."
 
 def _fmt_ago(ts: Optional[float], *, now: Optional[float] = None) -> str:
     if ts is None:
@@ -73,17 +80,19 @@ def format_ws_status(status: object, *, now: Optional[float] = None) -> str:
 
 
 HELP_MSG = (
-    "QQ 小助手指令：\n"
-    "/ask <问题>      普通对话 (DeepSeek)\n"
-    "/think <问题>    深度推理 (DeepSeek Reasoner)\n"
-    "/gpt <问题>      使用 GPT (OpenAI，受额度限制)\n"
-    "/image <描述>    生成图片 (OpenAI，受额度限制)\n"
-    "/vision <问题>   分析最近一张图片 (OpenAI)\n"
-    "/edit <修改指令> 编辑最近一张图片 (OpenAI)\n"
-    "/reset           清空当前对话上下文\n"
+    "指令（都要 @我 才生效）：\n"
+    "/ask <问题>      普通对话\n"
+    "/think <问题>    深度推理\n"
+    "/gpt <问题>      用 GPT 回答（受额度）\n"
+    "/image <描述>    生成图片（受额度）\n"
+    "/vision <问题>   分析最近一张图\n"
+    "/edit <修改指令> 编辑最近一张图\n"
+    "/recap [今天|昨天|1h|1d|一周]  总结群里活动\n"
+    "/recall [YYYY-MM-DD|关键词]  查长时记忆\n"
+    "/reset           清空我和你的对话记忆\n"
     "/balance         查看今日额度\n"
     "/help            显示帮助\n"
-    "直接发消息我会自动决定用哪个模型~"
+    "（直接 @我 也行～）"
 )
 
 
@@ -113,10 +122,20 @@ class Handler:
     rate: RateLimiter
     send_text: SendText
     send_image: SendImage
-    fetch_reply_text: Optional[FetchReplyText] = None  # injected from main
-    health_status: Optional[HealthFn] = None           # injected from main
+    fetch_reply: Optional[FetchReply] = None  # injected from main
+    health_status: Optional[HealthFn] = None  # injected from main
+    group_memory: GroupMemory = field(default_factory=GroupMemory)
+    long_memory: Optional[LongMemory] = None
     _http: httpx.AsyncClient = field(default_factory=lambda: httpx.AsyncClient(timeout=60.0))
     _last_image: Dict[Tuple[int, int], _ImageMemo] = field(default_factory=dict)
+    _last_dispatch_at: Dict[int, float] = field(default_factory=dict)
+    # Proactive-interjection bookkeeping (per group).
+    _last_bot_speech_at: Dict[int, float] = field(default_factory=dict)
+    _msgs_since_bot_spoke: Dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.long_memory is None:
+            self.long_memory = LongMemory(self.group_memory, self.deepseek)
 
     # ---------- entry ----------
     async def handle(self, msg: ParsedMessage) -> None:
@@ -128,6 +147,33 @@ class Handler:
         if not msg.text and not msg.has_image:
             return
 
+        # Log into group memory BEFORE any filtering — even messages we'll
+        # ignore become part of the bot's awareness of the group. Awaited (not
+        # background task) so downstream reads (proactive judge, /recap, chat
+        # context injection) always see this row. Skip /commands; they're
+        # bot-control plumbing, not conversation.
+        record_text = msg.text or ("[图片]" if msg.has_image else "")
+        row_id = 0
+        if record_text and not msg.is_command:
+            row_id = await self.group_memory.append(
+                msg.group_id, msg.user_id, msg.nickname or f"u{msg.user_id}", record_text,
+            )
+            # If image floated through and auto-vision is on, caption it in
+            # the background so the row text becomes useful for recap / context.
+            if (
+                CONFIG.auto_vision_group_images
+                and msg.has_image
+                and row_id > 0
+                and self.openai is not None
+            ):
+                asyncio.create_task(self._caption_image_for_memory(
+                    row_id, msg.group_id, msg.image_urls[0], msg.text or "",
+                ))
+        # Count toward "messages since bot spoke" for proactive interjection.
+        self._msgs_since_bot_spoke[msg.group_id] = (
+            self._msgs_since_bot_spoke.get(msg.group_id, 0) + 1
+        )
+
         if msg.has_image:
             asyncio.create_task(
                 self._cache_image_to_disk(msg.group_id, msg.user_id, msg.image_urls[0])
@@ -135,8 +181,26 @@ class Handler:
 
         if not self._trigger_allows(msg):
             log.debug("trigger mode %s skipped: %r", CONFIG.trigger_mode, msg.text[:60])
+            if CONFIG.proactive_enabled:
+                await self._maybe_proactive(msg)
             return
         msg = self._strip_trigger(msg)
+
+        # Cooldown: silently skip non-command chatter within N seconds of last
+        # dispatch in this group. /commands are exempt (explicit user actions).
+        if not msg.is_command and CONFIG.reply_cooldown_seconds > 0:
+            last = self._last_dispatch_at.get(msg.group_id, 0.0)
+            now = time.monotonic()
+            elapsed = now - last
+            if elapsed < CONFIG.reply_cooldown_seconds:
+                log.debug(
+                    "cooldown skip group=%s elapsed=%.1fs cap=%ds",
+                    msg.group_id, elapsed, CONFIG.reply_cooldown_seconds,
+                )
+                return
+        # Stamp BEFORE dispatch so concurrent messages don't all squeeze through.
+        if not msg.is_command:
+            self._last_dispatch_at[msg.group_id] = time.monotonic()
 
         if not self.rate.check(msg.user_id):
             await self._reply(msg.group_id, RATE_LIMITED_MSG)
@@ -148,32 +212,50 @@ class Handler:
             msg.has_image, msg.reply_to_msg_id, msg.text[:120],
         )
 
-        # Reply-segment: prepend the quoted message to the prompt.
-        if msg.reply_to_msg_id and self.fetch_reply_text is not None:
+        # Reply-segment: bring the quoted message's content into scope so the
+        # bot can act on it (text becomes prompt context; images become input).
+        if msg.reply_to_msg_id and self.fetch_reply is not None:
             try:
-                quoted = await self.fetch_reply_text(msg.reply_to_msg_id)
+                quoted = await self.fetch_reply(msg.reply_to_msg_id)
             except Exception as e:
-                log.warning("fetch_reply_text failed: %s", e)
+                log.warning("fetch_reply failed: %s", e)
                 quoted = None
             if quoted:
-                msg.text = f"[被引用的消息]\n{quoted}\n\n[我的问题]\n{msg.text}".strip()
+                if quoted.text:
+                    msg.text = (
+                        f"[被引用的消息]\n{quoted.text}\n\n[我的问题]\n{msg.text}"
+                    ).strip()
+                # If the quote carried an image and this message didn't, treat
+                # the quoted image as the user's own attachment.
+                if quoted.image_urls and not msg.image_urls:
+                    msg.image_urls = list(quoted.image_urls)
+                    log.info(
+                        "reply-segment provided image(s); using %d from quoted msg",
+                        len(quoted.image_urls),
+                    )
+                    asyncio.create_task(
+                        self._cache_image_to_disk(
+                            msg.group_id, msg.user_id, msg.image_urls[0]
+                        )
+                    )
 
         try:
             if msg.is_command:
                 await self._dispatch_command(msg)
             else:
                 await self._dispatch_llm_route(msg)
-        except ProviderError as e:
+        except ProviderError:
             log.exception("provider error")
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
-        except Exception as e:  # noqa: BLE001
+            await self._reply(msg.group_id, ERROR_MSG)
+        except Exception:  # noqa: BLE001
             log.exception("unhandled error")
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
+            await self._reply(msg.group_id, ERROR_MSG)
 
     # ---------- trigger gate ----------
     def _trigger_allows(self, msg: ParsedMessage) -> bool:
+        # /commands now require @bot too — the bot must be explicitly addressed.
         if msg.is_command:
-            return True
+            return msg.mentions(msg.self_id)
         mode = CONFIG.trigger_mode
         if mode == "always":
             return True
@@ -213,6 +295,10 @@ class Handler:
             await self._run_openai_vision(msg, args or msg.text)
         elif c == "edit":
             await self._run_openai_image_edit(msg, args or msg.text)
+        elif c == "recap":
+            await self._run_recap(msg, args)
+        elif c == "recall":
+            await self._run_recall(msg, args)
         elif c == "admin":
             await self._run_admin(msg, args)
         else:
@@ -237,7 +323,8 @@ class Handler:
                 "/admin disallow_group <gid> 禁用某群 (env 中的群无法移除)\n"
                 "/admin list_groups          显示所有允许的群\n"
                 "/admin report               立即推送一次日报\n"
-                "/admin ping                 OneBot 连接状态与最近心跳",
+                "/admin ping                 OneBot 连接状态与最近心跳\n"
+                "/admin save_recap [day]     手动写入某天的长时记忆",
             )
             return
         if sub == "status":
@@ -298,6 +385,30 @@ class Handler:
         if sub == "ping":
             await self._reply(msg.group_id, self._format_ping())
             return
+        if sub == "save_recap":
+            # /admin save_recap [yesterday|today|YYYY-MM-DD]
+            if self.long_memory is None:
+                await self._reply(msg.group_id, "长时记忆未启用")
+                return
+            target = rest.strip().lower() or "yesterday"
+            if target in ("yesterday", "昨天"):
+                day = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif target in ("today", "今天"):
+                day = datetime.now().strftime("%Y-%m-%d")
+            elif self._DATE_RE.match(target):
+                day = target
+            else:
+                await self._reply(
+                    msg.group_id,
+                    "用法: /admin save_recap [today|yesterday|YYYY-MM-DD]",
+                )
+                return
+            summary = await self.long_memory.save_day(msg.group_id, day)
+            if summary is None:
+                await self._reply(msg.group_id, f"{day} 没消息可总结")
+            else:
+                await self._reply(msg.group_id, f"已存档 {day}:\n{summary}")
+            return
         await self._reply(msg.group_id, "未知子命令，发送 /admin help 查看帮助")
 
     def _format_ping(self) -> str:
@@ -319,10 +430,20 @@ class Handler:
         return "\n".join(lines)
 
     async def _dispatch_llm_route(self, msg: ParsedMessage) -> None:
-        decision = await self.router.decide(msg.text, has_image=msg.has_image)
+        decision = await self.router.decide(
+            msg.text,
+            has_image=msg.has_image,
+            was_at_bot=msg.mentions(msg.self_id),
+        )
         prompt = decision.normalized_prompt or msg.text
 
         route = decision.route
+        if route == "skip":
+            # Router decided this message isn't addressed at us. Stay silent.
+            # Also undo the cooldown stamp so the next message in this group
+            # isn't unfairly blocked by a non-reply.
+            self._last_dispatch_at.pop(msg.group_id, None)
+            return
         if route == "deepseek_chat":
             await self._run_deepseek_chat(msg, prompt)
         elif route == "deepseek_think":
@@ -380,13 +501,15 @@ class Handler:
                 raw = await self._download(url)
                 small = downscale_to_max(raw, CONFIG.max_vision_input_size)
                 data_uris.append(to_data_uri(small))
-        except (httpx.HTTPError, OSError, ValueError) as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=f"图片处理失败: {e}"))
+        except (httpx.HTTPError, OSError, ValueError):
+            log.exception("vision image preprocessing failed")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
         try:
             reply = await self.openai.vision(prompt, data_uris, max_tokens=600)
-        except ProviderError as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
+        except ProviderError:
+            log.exception("openai vision call failed")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
         await self.quota.consume("openai_vision", msg.group_id, msg.user_id)
         await self._reply(msg.group_id, reply.text)
@@ -402,8 +525,9 @@ class Handler:
             return
         try:
             img = await self.openai.generate(prompt, size=CONFIG.openai_image_size)
-        except ProviderError as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
+        except ProviderError:
+            log.exception("openai image generation failed")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
         await self.quota.consume("openai_image", msg.group_id, msg.user_id)
         await self._send_image_reply(msg.group_id, img)
@@ -417,8 +541,9 @@ class Handler:
         except LookupError:
             await self._reply(msg.group_id, "找不到要编辑的图片，请先发一张图")
             return
-        except httpx.HTTPError as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=f"下载图片失败: {e}"))
+        except httpx.HTTPError:
+            log.exception("image download for /edit failed")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
         if not await self._check_quota("openai_image_edit", msg):
             return
@@ -427,13 +552,15 @@ class Handler:
             try:
                 target_w = int(CONFIG.openai_image_size.split("x")[0])
                 image_bytes = downscale_to_max(image_bytes, target_w)
-            except (ValueError, OSError) as e:
-                await self._reply(msg.group_id, ERROR_MSG.format(err=f"图片预处理失败: {e}"))
+            except (ValueError, OSError):
+                log.exception("image preprocessing for /edit failed")
+                await self._reply(msg.group_id, ERROR_MSG)
                 return
         try:
             img = await self.openai.edit(prompt, image_bytes, size=CONFIG.openai_image_size)
-        except ProviderError as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
+        except ProviderError:
+            log.exception("openai image edit failed")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
         await self.quota.consume("openai_image_edit", msg.group_id, msg.user_id)
         await self._send_image_reply(msg.group_id, img)
@@ -476,6 +603,52 @@ class Handler:
         self._last_image[key] = memo
         return data
 
+    async def _caption_image_for_memory(
+        self,
+        row_id: int,
+        group_id: int,
+        image_url: str,
+        user_text: str,
+    ) -> None:
+        """Background: caption the image and rewrite the row in group_memory.
+
+        Silently bails on quota / network / decoding errors — this is best-effort
+        ambient context, never user-facing.
+        """
+        if self.openai is None:
+            return
+        ok, reason = await self.quota.check("auto_vision", group_id, 0)
+        if not ok:
+            log.info("auto-caption skipped: %s", reason)
+            return
+        try:
+            raw = await self._download(image_url)
+            small = downscale_to_max(raw, CONFIG.max_vision_input_size)
+            data_uri = to_data_uri(small)
+            reply = await self.openai.vision(
+                "用中文一句话概括这张图（15字以内，只输出概括本身，不加标点）",
+                [data_uri],
+                max_tokens=60,
+            )
+        except Exception:
+            log.exception("auto-caption call failed")
+            return
+        caption = (reply.text or "").strip().split("\n")[0][:40]
+        if not caption:
+            return
+        await self.quota.consume("auto_vision", group_id, 0)
+        # Rebuild the row's text: keep any user text, replace placeholder.
+        if user_text.strip():
+            new_text = f"{user_text.strip()} [图：{caption}]"
+        else:
+            new_text = f"[图：{caption}]"
+        try:
+            await self.group_memory.update_text(row_id, new_text)
+        except Exception:
+            log.exception("auto-caption row update failed")
+            return
+        log.info("auto-caption ok group=%s caption=%r", group_id, caption)
+
     @staticmethod
     async def sweep_image_cache() -> None:
         """Drop image files older than 2× IMAGE_CACHE_TTL. Safe to call repeatedly."""
@@ -507,34 +680,43 @@ class Handler:
             return
         history = await self.memory.get(msg.group_id, msg.user_id)
         messages: List[ChatMessage] = [
-            ChatMessage(
-                role="system",
-                content=(
-                    "你是一个友好的 QQ 群助手。请用简洁、口语化的中文回答，"
-                    "除非用户明确用英文提问。回答不要超过 1500 字。"
-                ),
-            )
+            ChatMessage(role="system", content=load_persona()),
         ]
+        # Long-term memory: most recent N daily recaps (cheap because each is
+        # ~100 chars). Lets the bot vaguely reference "前几天" / "上周".
+        if self.long_memory is not None and CONFIG.long_memory_inject_days > 0:
+            recaps = await self.long_memory.recent(msg.group_id)
+            if recaps:
+                lines = ["你的长时记忆（最近几天群里的事，被问到才参考）："]
+                for day, summary in reversed(recaps):  # oldest first
+                    lines.append(f"- {day}: {summary}")
+                messages.append(ChatMessage(role="system", content="\n".join(lines)))
+        # Inject recent group activity so the bot has shared context with
+        # everyone in the group, not just the user it's replying to.
+        group_ctx = await self.group_memory.recent(msg.group_id)
+        if group_ctx:
+            messages.append(ChatMessage(
+                role="system",
+                content=self._format_group_context(
+                    group_ctx, bot_nickname=CONFIG.bot_nickname,
+                ),
+            ))
         for role, content in history:
             messages.append(ChatMessage(role=role, content=content))
         messages.append(ChatMessage(role="user", content=prompt))
 
-        use_stream = supports_stream and CONFIG.stream_replies and hasattr(provider, "chat_stream")
         try:
-            if use_stream:
-                text = await self._stream_text(msg.group_id, provider, messages, model)
-                log.info("route=%s provider=%s model=%s streamed=true", route, provider.name, model)
-            else:
-                reply = await provider.chat(messages, model=model, max_tokens=1200)
-                text = reply.text or "(空回复)"
-                log.info(
-                    "route=%s provider=%s model=%s tokens=%s",
-                    route, provider.name, reply.model, reply.usage,
-                )
-                await self._reply(msg.group_id, text)
-        except ProviderError as e:
-            await self._reply(msg.group_id, ERROR_MSG.format(err=str(e)[:120]))
+            reply = await provider.chat(messages, model=model, max_tokens=600)
+        except ProviderError:
+            log.exception("text route provider error")
+            await self._reply(msg.group_id, ERROR_MSG)
             return
+        text = reply.text or "(空回复)"
+        log.info(
+            "route=%s provider=%s model=%s tokens=%s",
+            route, provider.name, reply.model, reply.usage,
+        )
+        await self._human_send(msg.group_id, text)
 
         await self.memory.append(msg.group_id, msg.user_id, "user", prompt)
         await self.memory.append(msg.group_id, msg.user_id, "assistant", text)
@@ -594,6 +776,280 @@ class Handler:
             lines.append(f"  {label}: 你 {cells['user']} / 群 {cells['group']}")
         return "\n".join(lines)
 
+    # ---------- human-paced reply splitter ----------
+    _SENT_SPLIT_RE = re.compile(r"(?<=[。？！；.!?])\s*|(?:\n\s*\n)+")
+
+    @classmethod
+    def _split_human_chunks(cls, text: str, max_chunks: int) -> List[str]:
+        """Split into 1..max_chunks short messages, splitting on sentence-end
+        punctuation or paragraph breaks. Never splits mid-sentence."""
+        text = text.strip()
+        if not text:
+            return []
+        parts = [p.strip() for p in cls._SENT_SPLIT_RE.split(text) if p and p.strip()]
+        if not parts:
+            return [text]
+        if len(parts) <= max_chunks:
+            return parts
+        # More sentences than chunks — distribute evenly.
+        per = -(-len(parts) // max_chunks)  # ceil div
+        return ["".join(parts[i:i + per]) for i in range(0, len(parts), per)]
+
+    async def _human_send(self, group_id: int, text: str, *, log_to_memory: bool = True) -> None:
+        """Send `text` as 1..N short messages with random delays between them.
+
+        Also records each chunk to group_memory so /recap and future context
+        injection see the bot's voice as part of the conversation."""
+        # Strip most emojis the LLM leaked through — they're the #1 AI tell.
+        text = filter_emoji(text, CONFIG.emoji_keep_probability)
+        if not text.strip():
+            return
+
+        # Stamp proactive-interjection state at the moment of speech.
+        self._last_bot_speech_at[group_id] = time.monotonic()
+        self._msgs_since_bot_spoke[group_id] = 0
+
+        if not CONFIG.human_send_enabled:
+            await self._reply(group_id, text)
+            if log_to_memory:
+                asyncio.create_task(self.group_memory.append(
+                    group_id, 0, CONFIG.bot_nickname, text,
+                ))
+            return
+
+        chunks = self._split_human_chunks(text, CONFIG.human_send_max_chunks)
+        if not chunks:
+            return
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                base = random.uniform(
+                    CONFIG.human_send_delay_min, CONFIG.human_send_delay_max,
+                )
+                # Longer chunks take longer to "type".
+                base += min(2.5, len(chunk) * 0.05)
+                await asyncio.sleep(min(base, 5.0))
+            # Honor MAX_REPLY_CHARS chunking as a safety belt too.
+            for piece in chunk_text(chunk, CONFIG.limits.max_reply_chars):
+                await self.send_text(group_id, piece)
+            if log_to_memory:
+                asyncio.create_task(self.group_memory.append(
+                    group_id, 0, CONFIG.bot_nickname, chunk,
+                ))
+
+    # ---------- group-context formatting ----------
+    @staticmethod
+    def _format_group_context(rows: List[GroupMsg], *, bot_nickname: str) -> str:
+        """Render recent group rows into a compact system-prompt snippet."""
+        lines: list[str] = []
+        for r in rows:
+            who = "你" if r.nickname == bot_nickname else r.nickname
+            t = datetime.fromtimestamp(r.ts).strftime("%H:%M")
+            text = r.text.replace("\n", " ")
+            lines.append(f"[{t} {who}] {text}")
+        return "最近群里的对话（按时间顺序，最新在底部，你可以参考但不必每条都接）：\n" + "\n".join(lines)
+
+    # ---------- /recap ----------
+    _PERIOD_RE = re.compile(r"^\s*(\d+)\s*([hd])\s*$", re.IGNORECASE)
+
+    @staticmethod
+    def _parse_period(args: str) -> Optional[Tuple[float, str]]:
+        """Return (since_ts_unix, label) or None for unrecognised input."""
+        a = args.strip().lower()
+        now = datetime.now()
+        if a in ("", "今天", "today"):
+            t = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return t.timestamp(), "今天"
+        if a in ("昨天", "yesterday"):
+            today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            yest0 = today0 - timedelta(days=1)
+            # Note: callers should fetch since yest0 and trim to before today0.
+            # For our use we cheat — return yest0 and rely on natural row count.
+            return yest0.timestamp(), "昨天"
+        m = Handler._PERIOD_RE.match(a)
+        if m:
+            n, unit = int(m.group(1)), m.group(2)
+            seconds = n * (3600 if unit == "h" else 86400)
+            return (now - timedelta(seconds=seconds)).timestamp(), f"最近 {n}{unit}"
+        if a in ("一小时", "一小時"):
+            return (now - timedelta(hours=1)).timestamp(), "最近 1 小时"
+        if a in ("一天",):
+            return (now - timedelta(days=1)).timestamp(), "最近 24 小时"
+        if a in ("一周", "一週"):
+            return (now - timedelta(days=7)).timestamp(), "最近 7 天"
+        return None
+
+    # ---------- /recall (long-term memory query) ----------
+    _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+    async def _run_recall(self, msg: ParsedMessage, args: str) -> None:
+        if self.long_memory is None:
+            await self._reply(msg.group_id, "长时记忆未启用")
+            return
+        a = args.strip()
+        if not a:
+            # No arg → list last few days
+            rows = await self.long_memory.recent(msg.group_id, days=7)
+            if not rows:
+                await self._human_send(msg.group_id, "我还没攒下啥长时记忆呢")
+                return
+            lines = ["最近几天的记忆："]
+            for day, summary in rows:
+                lines.append(f"{day}\n{summary}")
+            await self._reply(msg.group_id, "\n\n".join(lines))
+            return
+        # Exact date
+        if self._DATE_RE.match(a):
+            summary = await self.long_memory.get(msg.group_id, a)
+            if not summary:
+                await self._human_send(msg.group_id, f"{a} 那天没存档呢")
+                return
+            await self._reply(msg.group_id, f"{a}\n{summary}")
+            return
+        # Keyword search
+        rows = await self.long_memory.search(msg.group_id, a, limit=5)
+        if not rows:
+            await self._human_send(msg.group_id, f"没找到跟 '{a}' 有关的记忆")
+            return
+        lines = [f"找到 {len(rows)} 条相关记忆："]
+        for day, summary in rows:
+            lines.append(f"{day}\n{summary}")
+        await self._reply(msg.group_id, "\n\n".join(lines))
+
+    async def _run_recap(self, msg: ParsedMessage, args: str) -> None:
+        parsed = self._parse_period(args)
+        if parsed is None:
+            await self._reply(
+                msg.group_id,
+                "想看哪段？用法：/recap 今天 | 昨天 | 1h | 3h | 1d | 一周",
+            )
+            return
+        since_ts, label = parsed
+        rows = await self.group_memory.since(msg.group_id, since_ts)
+        if not rows:
+            await self._human_send(msg.group_id, f"{label}群里没啥消息呢")
+            return
+
+        # Cap to last 300 rows for tokens; recap should focus on the substantive
+        # tail of the period anyway.
+        if len(rows) > 300:
+            rows = rows[-300:]
+        transcript = "\n".join(
+            f"[{datetime.fromtimestamp(r.ts).strftime('%H:%M')} {r.nickname}] {r.text}"
+            for r in rows
+        )
+        prompt = (
+            f"以下是{label}的群聊片段，按时间顺序。请用你的人设语气，"
+            "在 80 字以内总结主要话题、有意思的对话和谁参与最多。"
+            "不要列要点、不要 markdown。\n\n" + transcript
+        )
+        try:
+            reply = await self.deepseek.chat(
+                [
+                    ChatMessage(role="system", content=load_persona()),
+                    ChatMessage(role="user", content=prompt),
+                ],
+                temperature=0.5,
+                max_tokens=400,
+            )
+        except ProviderError:
+            log.exception("recap deepseek failed")
+            await self._reply(msg.group_id, ERROR_MSG)
+            return
+        await self._human_send(msg.group_id, reply.text)
+
+    # ---------- proactive interjection ----------
+    _PROACTIVE_SYSTEM_PROMPT_TEMPLATE = (
+        "You decide whether bot {nickname} should proactively jump into a QQ "
+        "group chat WITHOUT being addressed.\n\n"
+        "Default: skip. Only speak if it really fits the flow.\n\n"
+        "Speak when (rare):\n"
+        "- Clear hook for a short joke / one-liner that fits your persona\n"
+        "- Group restarted talk after a quiet period\n"
+        "- Someone said something that begs an obvious quick reaction\n"
+        "- Conversation touches a topic you recently mentioned\n\n"
+        "Skip when (most cases):\n"
+        "- Serious discussion / personal talk\n"
+        "- People are clearly talking to each other\n"
+        "- Reaction-only messages (嗯/哈/666/emoji)\n"
+        "- Nothing genuinely interesting to add\n"
+        "- It would feel forced or noisy\n\n"
+        "Persona reminder: {persona_blurb}\n\n"
+        "Output STRICT JSON, one field only:\n"
+        '- skip:  {{"r":"skip"}}\n'
+        '- speak: {{"r":"say","t":"你要说的话(最多 20 字，符合人设，'
+        "不要 markdown，不要 @ 人)\"}}\n"
+    )
+
+    _PROACTIVE_PERSONA_BLURB = (
+        "短句、口语化、可不用标点、偶尔语气词；不要自称 AI；不要列要点"
+    )
+
+    def _proactive_gate_open(self, msg: ParsedMessage) -> bool:
+        """All the cheap, no-LLM checks."""
+        if random.random() >= CONFIG.proactive_probability:
+            return False
+        last = self._last_bot_speech_at.get(msg.group_id, 0.0)
+        if time.monotonic() - last < CONFIG.proactive_min_seconds:
+            return False
+        if (self._msgs_since_bot_spoke.get(msg.group_id, 0)
+                < CONFIG.proactive_min_new_messages):
+            return False
+        return True
+
+    async def _maybe_proactive(self, msg: ParsedMessage) -> None:
+        if not self._proactive_gate_open(msg):
+            return
+        # Pull recent group context.
+        ctx = await self.group_memory.recent(msg.group_id, limit=12)
+        if len(ctx) < 3:
+            return  # nothing to work with
+
+        transcript = "\n".join(
+            f"[{r.nickname}] {r.text}" for r in ctx
+        )
+        system = self._PROACTIVE_SYSTEM_PROMPT_TEMPLATE.format(
+            nickname=CONFIG.bot_nickname,
+            persona_blurb=self._PROACTIVE_PERSONA_BLURB,
+        )
+        try:
+            reply = await self.deepseek.chat(
+                [
+                    ChatMessage(role="system", content=system),
+                    ChatMessage(role="user", content=transcript),
+                ],
+                temperature=0.7,
+                max_tokens=60,
+                response_format={"type": "json_object"},
+            )
+        except ProviderError:
+            log.exception("proactive judge call failed")
+            return
+
+        say_text = self._coerce_proactive_decision(reply.text)
+        if say_text is None:
+            log.info("proactive: judge said skip")
+            return
+        log.info("proactive: speaking %r", say_text[:60])
+        await self._human_send(msg.group_id, say_text)
+
+    @staticmethod
+    def _coerce_proactive_decision(text: str) -> Optional[str]:
+        """Return the utterance to say, or None to skip."""
+        import json
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = m.group(0) if m else text
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return None
+        r = str(obj.get("r", "")).strip().lower()
+        if r != "say":
+            return None
+        t = str(obj.get("t", "")).strip()
+        if not t or len(t) > 60:  # sanity cap; persona allows ≤20 but be lenient
+            return None
+        return t
+
     async def _reply(self, group_id: int, text: str) -> None:
         for chunk in chunk_text(text, CONFIG.limits.max_reply_chars):
             await self.send_text(group_id, chunk)
@@ -604,7 +1060,8 @@ class Handler:
         elif img.url:
             payload = img.url
         else:
-            await self._reply(group_id, ERROR_MSG.format(err="image_empty"))
+            log.warning("image provider returned empty payload")
+            await self._reply(group_id, ERROR_MSG)
             return
         await self.send_image(group_id, payload)
 

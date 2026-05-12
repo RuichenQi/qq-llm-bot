@@ -66,6 +66,10 @@ def test_format_never_connected():
 
 
 def _event(text: str, *, user_id: int = 42):
+    segs: list = []
+    if text.startswith("/"):
+        segs.append({"type": "at", "data": {"qq": "10000"}})
+    segs.append({"type": "text", "data": {"text": text}})
     return {
         "post_type": "message",
         "message_type": "group",
@@ -73,7 +77,7 @@ def _event(text: str, *, user_id: int = 42):
         "group_id": 1,
         "user_id": user_id,
         "raw_message": text,
-        "message": [{"type": "text", "data": {"text": text}}],
+        "message": segs,
         "sender": {"user_id": user_id, "nickname": "x"},
     }
 
@@ -98,7 +102,7 @@ def _make_handler(monkeypatch, *, health=None) -> Tuple[Handler, List[Tuple[int,
 
     stub_router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image):
+    async def decide(text, *, has_image, was_at_bot=False):
         from bot.router import RouteDecision
         return RouteDecision("deepseek_chat", 1.0, "stub", text)
 

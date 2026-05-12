@@ -50,6 +50,9 @@ class Limits:
     openai_image_edit_user: int = _env_int("DAILY_OPENAI_IMAGE_EDIT_USER", 1)
     openai_vision_group: int = _env_int("DAILY_OPENAI_VISION_GROUP", 20)
     openai_vision_user: int = _env_int("DAILY_OPENAI_VISION_USER", 5)
+    # Hard cap for auto-captioning images that float through the group (only
+    # consulted when AUTO_VISION_GROUP_IMAGES=1).
+    auto_vision_group: int = _env_int("AUTO_VISION_DAILY_MAX", 100)
     rate_limit_per_min: int = _env_int("RATE_LIMIT_USER_PER_MIN", 15)
     max_reply_chars: int = _env_int("MAX_REPLY_CHARS", 1800)
     max_history_turns: int = _env_int("MAX_HISTORY_TURNS", 8)
@@ -72,9 +75,11 @@ class Config:
     openai_image_size: str = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
     # gpt-image-* only. Accepted: low | medium | high | auto. Ignored by dall-e-*.
     openai_image_quality: str = os.getenv("OPENAI_IMAGE_QUALITY", "low")
-    # Uploaded images are downscaled to fit within this box before being sent
-    # to the vision API — cuts token cost dramatically (~free).
-    max_vision_input_size: int = _env_int("MAX_VISION_INPUT_SIZE", 128)
+    # Uploaded images are downscaled to fit within this box (px). 512 fits one
+    # OpenAI "low detail" tile — flat 85 tokens (~$0.000013) regardless of
+    # input size. Going smaller doesn't save tokens AND breaks recognition
+    # (model refuses with "I can't view images" below ~256px).
+    max_vision_input_size: int = _env_int("MAX_VISION_INPUT_SIZE", 512)
 
     onebot_ws_url: str = os.getenv("ONEBOT_WS_URL", "ws://127.0.0.1:3001")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
@@ -85,6 +90,9 @@ class Config:
 
     trigger_mode: str = os.getenv("TRIGGER_MODE", "always").lower()  # always | mention | prefix
     trigger_prefix: str = os.getenv("TRIGGER_PREFIX", "#")
+    # After the bot replies in a group, silently ignore further non-command
+    # messages in that group for this many seconds. 0 disables.
+    reply_cooldown_seconds: int = _env_int("REPLY_COOLDOWN_SECONDS", 0)
 
     image_cache_ttl: int = _env_int("IMAGE_CACHE_TTL", 600)  # seconds
 
@@ -93,12 +101,80 @@ class Config:
     # Time of day to send the daily report, 24h "HH:MM" local time.
     daily_report_time: str = os.getenv("DAILY_REPORT_TIME", "23:55")
 
+    # ----- Long-term memory (daily recap of every allowed group) -----
+    daily_recap_enabled: bool = (
+        os.getenv("DAILY_RECAP_ENABLED", "1") not in ("0", "false", "False")
+    )
+    # When the daily-recap task fires (local time). Default early morning so
+    # yesterday's data is complete and the group is quiet.
+    daily_recap_time: str = os.getenv("DAILY_RECAP_TIME", "03:30")
+    # Recaps older than this are pruned.
+    daily_recap_keep_days: int = _env_int("DAILY_RECAP_KEEP_DAYS", 365)
+    # How many recent daily recaps to inject as "long memory" into each chat
+    # call. 0 disables long-memory injection (but recaps are still saved).
+    long_memory_inject_days: int = _env_int("LONG_MEMORY_INJECT_DAYS", 3)
+
     # Streaming. When true, DeepSeek replies are streamed in chunks into QQ.
     stream_replies: bool = (os.getenv("STREAM_REPLIES", "1") not in ("0", "false", "False"))
     stream_flush_chars: int = _env_int("STREAM_FLUSH_CHARS", 220)
 
     allowed_groups: Set[int] = field(default_factory=lambda: _csv_ints(os.getenv("ALLOWED_GROUPS")))
     superusers: Set[int] = field(default_factory=lambda: _csv_ints(os.getenv("SUPERUSERS")))
+
+    # The bot's QQ nickname. Used by the router to decide if a message is
+    # "directed at the bot" (in addition to @-mentions).
+    bot_nickname: str = os.getenv("BOT_NICKNAME", "小笨蛋")
+
+    # Optional path to a custom persona file. If empty/missing, the default
+    # persona in bot/persona.py is used. The file can use {nickname} which
+    # will be replaced with bot_nickname.
+    bot_persona_file: str = os.getenv("BOT_PERSONA_FILE", "")
+
+    # ----- Group-wide memory (lets the bot "hear" the whole group) -----
+    # Max rows kept per group (oldest pruned).
+    group_memory_max: int = _env_int("GROUP_MEMORY_MAX", 500)
+    # How many recent group messages to inject into each chat call as context.
+    group_context_turns: int = _env_int("GROUP_CONTEXT_TURNS", 15)
+
+    # ----- Human-pacing of replies -----
+    # Split each bot reply into N short messages with a random delay between
+    # each. Set human_send_enabled=0 to disable and revert to instant one-shot.
+    human_send_enabled: bool = (
+        os.getenv("HUMAN_SEND_ENABLED", "1") not in ("0", "false", "False")
+    )
+    human_send_max_chunks: int = _env_int("HUMAN_SEND_MAX_CHUNKS", 3)
+    human_send_delay_min: float = float(os.getenv("HUMAN_SEND_DELAY_MIN", "0.6"))
+    human_send_delay_max: float = float(os.getenv("HUMAN_SEND_DELAY_MAX", "2.0"))
+
+    # ----- Emoji post-filter on bot output -----
+    # After the LLM replies, every emoji has this probability of SURVIVING.
+    # 0.10 = strip ~90% of emojis the model produces. Lower = more aggressive.
+    emoji_keep_probability: float = float(os.getenv("EMOJI_KEEP_PROBABILITY", "0.10"))
+
+    # ----- Auto-vision for group images -----
+    # When ON, every image that floats through the group gets a quick caption
+    # via OpenAI vision and the caption is stored in group_memory. Costs about
+    # $0.000028 per image; daily cap (limits.auto_vision_group) prevents
+    # runaway spend.
+    auto_vision_group_images: bool = (
+        os.getenv("AUTO_VISION_GROUP_IMAGES", "0") not in ("0", "false", "False")
+    )
+
+    # ----- Proactive interjection -----
+    # When a message is NOT addressed to the bot, the bot may occasionally
+    # decide on its own to chime in. Default to OFF until tuned.
+    proactive_enabled: bool = (
+        os.getenv("PROACTIVE_ENABLED", "1") not in ("0", "false", "False")
+    )
+    # Probability (0..1) each non-addressed message is even considered.
+    # The actual decision is then made by an LLM judge that mostly says skip.
+    proactive_probability: float = float(os.getenv("PROACTIVE_PROBABILITY", "0.08"))
+    # Minimum seconds since the bot last spoke in this group before another
+    # proactive interjection is allowed.
+    proactive_min_seconds: int = _env_int("PROACTIVE_MIN_SECONDS", 90)
+    # Minimum non-bot messages observed in the group since the bot last spoke.
+    # Prevents firing back-to-back with a normal reply.
+    proactive_min_new_messages: int = _env_int("PROACTIVE_MIN_NEW_MESSAGES", 3)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     limits: Limits = field(default_factory=Limits)

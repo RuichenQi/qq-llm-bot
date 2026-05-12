@@ -7,6 +7,13 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
+class QuotedMessage:
+    """A fetched OneBot get_msg payload — text + any image URLs from the quote."""
+    text: str
+    image_urls: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ParsedMessage:
     self_id: int
     group_id: int
