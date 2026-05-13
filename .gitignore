@@ -25,6 +25,7 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+.claude/
 *.swp
 
 # Third-party binaries (NapCat / QQ NT) — install locally, don't commit
