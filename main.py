@@ -94,36 +94,37 @@ async def _image_sweeper(period_s: int = 600) -> None:
             log.exception("image sweeper iteration failed")
 
 
-async def _daily_recap_loop(handler: Handler) -> None:
-    """Once a day, save yesterday's recap for every allowed group + prune old."""
-    if not CONFIG.daily_recap_enabled:
-        return
-    log.info("daily recap scheduled for %s", CONFIG.daily_recap_time)
+async def _maintenance_loop(handler: Handler) -> None:
+    """Periodic housekeeping: rolling daily-recap refresh + memories dedup
+    + expiry. Replaces the once-a-day recap loop. Cadence from config."""
+    period = max(60, CONFIG.maintenance_tick_seconds)
+    log.info("maintenance loop tick every %ds", period)
     while True:
         try:
-            wait_s = await _seconds_until(CONFIG.daily_recap_time)
-            await asyncio.sleep(wait_s)
-            if handler.long_memory is None:
-                continue
-            groups = sorted(await allowlist.all_allowed_groups())
-            for gid in groups:
-                try:
-                    summary = await handler.long_memory.save_yesterday(gid)
-                    if summary:
-                        log.info("daily recap saved for group %s", gid)
-                except Exception:
-                    log.exception("daily recap failed for group %s", gid)
-            try:
-                pruned = await handler.long_memory.prune()
-                if pruned:
-                    log.info("daily recap pruned %d old rows", pruned)
-            except Exception:
-                log.exception("daily recap prune failed")
+            await asyncio.sleep(period)
+            await handler.run_maintenance()
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("daily recap loop iteration failed")
+            log.exception("maintenance loop iteration failed")
             await asyncio.sleep(60)
+
+
+async def _reminder_loop(handler: Handler) -> None:
+    """Fire due reminders from the important-memory layer."""
+    if not CONFIG.important_memory_enabled:
+        return
+    period = max(10, CONFIG.reminder_tick_seconds)
+    log.info("reminder loop tick every %ds", period)
+    while True:
+        try:
+            await asyncio.sleep(period)
+            await handler.fire_due_reminders()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("reminder loop iteration failed")
+            await asyncio.sleep(30)
 
 
 async def amain() -> int:
@@ -210,7 +211,8 @@ async def amain() -> int:
     run_task = asyncio.create_task(client.run(), name="ws_run")
     report_task = asyncio.create_task(_daily_report_loop(handler), name="daily_report")
     sweeper_task = asyncio.create_task(_image_sweeper(), name="image_sweeper")
-    recap_task = asyncio.create_task(_daily_recap_loop(handler), name="daily_recap")
+    maint_task = asyncio.create_task(_maintenance_loop(handler), name="maintenance")
+    reminder_task = asyncio.create_task(_reminder_loop(handler), name="reminders")
     stop_task = asyncio.create_task(stop_event.wait(), name="stop_wait")
 
     try:
@@ -219,7 +221,8 @@ async def amain() -> int:
         )
     finally:
         await client.stop()
-        for t in (run_task, stop_task, report_task, sweeper_task, recap_task):
+        for t in (run_task, stop_task, report_task, sweeper_task,
+                  maint_task, reminder_task):
             if not t.done():
                 t.cancel()
         await handler.aclose()

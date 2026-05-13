@@ -30,6 +30,10 @@ def isolated_storage(tmp_path, monkeypatch):
     # Disable human-send delays in unit tests by default — tests that care
     # can re-enable it explicitly.
     monkeypatch.setattr(cfg.CONFIG, "human_send_enabled", False, raising=False)
+    # The important-memory classifier fires an extra LLM call per message;
+    # tests that don't opt in shouldn't see that behaviour leak into their
+    # stub provider's call log.
+    monkeypatch.setattr(cfg.CONFIG, "important_memory_enabled", False, raising=False)
 
     Storage._instance = None  # type: ignore[attr-defined]
     Storage._init_lock = None  # type: ignore[attr-defined]

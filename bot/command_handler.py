@@ -17,6 +17,7 @@ from bot import allowlist
 from bot.group_memory import GroupMemory, GroupMsg
 from bot.emoji_filter import filter_emoji
 from bot.image_utils import downscale_to_max, to_data_uri
+from bot.important_memory import ImportantMemory
 from bot.logger import get_logger
 from bot.long_memory import LongMemory
 from bot.memory import Memory
@@ -89,6 +90,7 @@ HELP_MSG = (
     "/edit <修改指令> 编辑最近一张图\n"
     "/recap [今天|昨天|1h|1d|一周]  总结群里活动\n"
     "/recall [YYYY-MM-DD|关键词]  查长时记忆\n"
+    "/remember [list|cancel <id>]  看/取消我帮你记的事\n"
     "/reset           清空我和你的对话记忆\n"
     "/balance         查看今日额度\n"
     "/help            显示帮助\n"
@@ -126,6 +128,7 @@ class Handler:
     health_status: Optional[HealthFn] = None  # injected from main
     group_memory: GroupMemory = field(default_factory=GroupMemory)
     long_memory: Optional[LongMemory] = None
+    important_memory: Optional[ImportantMemory] = None
     _http: httpx.AsyncClient = field(default_factory=lambda: httpx.AsyncClient(timeout=60.0))
     _last_image: Dict[Tuple[int, int], _ImageMemo] = field(default_factory=dict)
     _last_dispatch_at: Dict[int, float] = field(default_factory=dict)
@@ -136,6 +139,8 @@ class Handler:
     def __post_init__(self) -> None:
         if self.long_memory is None:
             self.long_memory = LongMemory(self.group_memory, self.deepseek)
+        if self.important_memory is None:
+            self.important_memory = ImportantMemory(self.deepseek)
 
     # ---------- entry ----------
     async def handle(self, msg: ParsedMessage) -> None:
@@ -168,6 +173,18 @@ class Handler:
             ):
                 asyncio.create_task(self._caption_image_for_memory(
                     row_id, msg.group_id, msg.image_urls[0], msg.text or "",
+                ))
+            # Important-memory classifier: text-only messages run through the
+            # LLM judge so reminders / facts / decisions get persisted. Cheap
+            # regex pre-filter inside maybe_extract gates the LLM call.
+            if (
+                CONFIG.important_memory_enabled
+                and self.important_memory is not None
+                and msg.text
+            ):
+                asyncio.create_task(self._safe_extract_memory(
+                    msg.group_id, msg.user_id,
+                    msg.nickname or f"u{msg.user_id}", msg.text,
                 ))
         # Count toward "messages since bot spoke" for proactive interjection.
         self._msgs_since_bot_spoke[msg.group_id] = (
@@ -299,6 +316,8 @@ class Handler:
             await self._run_recap(msg, args)
         elif c == "recall":
             await self._run_recall(msg, args)
+        elif c == "remember":
+            await self._run_remember(msg, args)
         elif c == "admin":
             await self._run_admin(msg, args)
         else:
@@ -649,6 +668,19 @@ class Handler:
             return
         log.info("auto-caption ok group=%s caption=%r", group_id, caption)
 
+    async def _safe_extract_memory(
+        self, group_id: int, user_id: int, nickname: str, text: str,
+    ) -> None:
+        """Background classifier wrapper that never raises."""
+        if self.important_memory is None:
+            return
+        try:
+            await self.important_memory.maybe_extract(
+                group_id=group_id, user_id=user_id, nickname=nickname, text=text,
+            )
+        except Exception:
+            log.exception("important-memory extract failed")
+
     @staticmethod
     async def sweep_image_cache() -> None:
         """Drop image files older than 2× IMAGE_CACHE_TTL. Safe to call repeatedly."""
@@ -701,6 +733,22 @@ class Handler:
                     group_ctx, bot_nickname=CONFIG.bot_nickname,
                 ),
             ))
+        # Inject important-memory recall: free-form facts/preferences/decisions
+        # the LLM classifier saved earlier. Personal items rank above group ones.
+        if (
+            CONFIG.important_memory_enabled
+            and self.important_memory is not None
+            and CONFIG.important_memory_recall_limit > 0
+        ):
+            mem_rows = await self.important_memory.recall_for_user(
+                msg.group_id, msg.user_id,
+                limit=CONFIG.important_memory_recall_limit,
+            )
+            mem_block = ImportantMemory.format_for_prompt(
+                mem_rows, speaker_user_id=msg.user_id,
+            )
+            if mem_block:
+                messages.append(ChatMessage(role="system", content=mem_block))
         for role, content in history:
             messages.append(ChatMessage(role=role, content=content))
         messages.append(ChatMessage(role="user", content=prompt))
@@ -915,6 +963,60 @@ class Handler:
             lines.append(f"{day}\n{summary}")
         await self._reply(msg.group_id, "\n\n".join(lines))
 
+    async def _run_remember(self, msg: ParsedMessage, args: str) -> None:
+        """List / cancel important memories. Defaults to listing for caller."""
+        if not CONFIG.important_memory_enabled or self.important_memory is None:
+            await self._reply(msg.group_id, "重要记忆功能没开~")
+            return
+        parts = args.strip().split(maxsplit=1)
+        sub = parts[0].lower() if parts else "list"
+        rest = parts[1] if len(parts) > 1 else ""
+        if sub == "cancel":
+            if not rest.isdigit():
+                await self._reply(msg.group_id, "用法: /remember cancel <id>")
+                return
+            ok = await self.important_memory.cancel(int(rest), msg.group_id)
+            await self._reply(
+                msg.group_id,
+                "已取消~" if ok else "找不到这条，或者已经取消/触发过了",
+            )
+            return
+        if sub in ("", "list"):
+            rows = await self.important_memory.list_pending(
+                msg.group_id, msg.user_id, limit=15,
+            )
+            if not rows:
+                await self._human_send(msg.group_id, "我现在没记着什么待办呢")
+                return
+            lines = ["我记着的事："]
+            now_ts = time.time()
+            for item_id, subj, content, trigger, recurrence in rows:
+                who = "（你）" if subj == msg.user_id else (
+                    "（群）" if subj is None else f"（u{subj}）"
+                )
+                t_part = ""
+                if trigger:
+                    delta = trigger - now_ts
+                    if delta < 0:
+                        t_part = " [应触发未发]"
+                    elif delta < 3600:
+                        t_part = f" [{int(delta // 60)} 分钟后]"
+                    elif delta < 86400:
+                        t_part = (
+                            f" [{datetime.fromtimestamp(trigger).strftime('%H:%M')}]"
+                        )
+                    else:
+                        t_part = (
+                            f" [{datetime.fromtimestamp(trigger).strftime('%m-%d %H:%M')}]"
+                        )
+                if recurrence:
+                    t_part += f" ({recurrence})"
+                lines.append(f"#{item_id} {who} {content}{t_part}")
+            lines.append("\n取消: /remember cancel <id>")
+            await self._reply(msg.group_id, "\n".join(lines))
+            return
+        await self._reply(msg.group_id, "用法: /remember [list|cancel <id>]")
+
     async def _run_recap(self, msg: ParsedMessage, args: str) -> None:
         parsed = self._parse_period(args)
         if parsed is None:
@@ -929,10 +1031,12 @@ class Handler:
             await self._human_send(msg.group_id, f"{label}群里没啥消息呢")
             return
 
-        # Cap to last 300 rows for tokens; recap should focus on the substantive
-        # tail of the period anyway.
-        if len(rows) > 300:
-            rows = rows[-300:]
+        # Feed the whole period to the LLM — recap quality drops sharply when
+        # we throw out the beginning. The hard cap (well above GROUP_MEMORY_MAX)
+        # is just a runaway-token safety belt; in normal operation we never hit
+        # it because storage tops out at CONFIG.group_memory_max rows.
+        if len(rows) > 3000:
+            rows = rows[-3000:]
         transcript = "\n".join(
             f"[{datetime.fromtimestamp(r.ts).strftime('%H:%M')} {r.nickname}] {r.text}"
             for r in rows
@@ -1084,6 +1188,85 @@ class Handler:
                 return  # someone (or a previous run) already sent today's
         text = await self._format_global_usage()
         await self._reply(gid, "📊 今日 LLM 用量日报\n" + text)
+
+    # ---------- reminder firing ----------
+    async def fire_due_reminders(self) -> int:
+        """Send any due reminders. Called by the periodic loop in main.py.
+        Returns number of reminders fired."""
+        if not CONFIG.important_memory_enabled or self.important_memory is None:
+            return 0
+        try:
+            due = await self.important_memory.due_reminders()
+        except Exception:
+            log.exception("due_reminders query failed")
+            return 0
+        fired = 0
+        for item_id, group_id, subject_user_id, content, _src_nick, recurrence in due:
+            if not await allowlist.is_allowed(group_id):
+                # Group de-allowed since the memory was created — drop the row.
+                await self.important_memory.cancel(item_id, group_id)
+                continue
+            try:
+                # Compose the reminder body. If we know who it's for, @-mention.
+                if subject_user_id and subject_user_id > 0:
+                    body = f"[CQ:at,qq={subject_user_id}] {content}"
+                else:
+                    body = content
+                await self.send_text(group_id, body)
+                await self.important_memory.mark_fired(item_id, recurrence)
+                fired += 1
+                log.info(
+                    "reminder fired id=%s group=%s subject=%s recur=%s",
+                    item_id, group_id, subject_user_id, recurrence,
+                )
+            except Exception:
+                log.exception("reminder send failed id=%s group=%s",
+                              item_id, group_id)
+        return fired
+
+    # ---------- maintenance pass ----------
+    async def run_maintenance(self) -> None:
+        """Periodic housekeeping: rolling recap refresh + memories dedup/expiry.
+        Idempotent and safe to call frequently."""
+        groups: List[int] = []
+        try:
+            groups = sorted(await allowlist.all_allowed_groups())
+        except Exception:
+            log.exception("maintenance: failed to enumerate groups")
+            return
+        # Rolling daily-recap refresh for today + yesterday (idempotent upsert).
+        if (
+            CONFIG.daily_recap_enabled
+            and self.long_memory is not None
+            and groups
+        ):
+            today = datetime.now().strftime("%Y-%m-%d")
+            yest = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            for gid in groups:
+                for day in (today, yest):
+                    try:
+                        await self.long_memory.save_day(gid, day)
+                    except Exception:
+                        log.exception(
+                            "maintenance: save_day failed group=%s day=%s",
+                            gid, day,
+                        )
+            try:
+                pruned = await self.long_memory.prune()
+                if pruned:
+                    log.info("maintenance: pruned %d old recap rows", pruned)
+            except Exception:
+                log.exception("maintenance: recap prune failed")
+        # Memories dedup + expiry.
+        if (
+            CONFIG.important_memory_enabled
+            and self.important_memory is not None
+            and groups
+        ):
+            try:
+                await self.important_memory.maintenance_pass(groups)
+            except Exception:
+                log.exception("maintenance: memory pass failed")
 
     async def aclose(self) -> None:
         await self._http.aclose()

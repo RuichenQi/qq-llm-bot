@@ -78,6 +78,31 @@ CREATE TABLE IF NOT EXISTS daily_recaps (
 );
 CREATE INDEX IF NOT EXISTS daily_recaps_by_group_day
     ON daily_recaps(group_id, day);
+
+-- Important-memory layer: free-form things the classifier decided are worth
+-- keeping. Two consumption paths share this table:
+--   (1) reminder firing loop: rows with trigger_at <= now and status='pending'
+--   (2) context injection on chat: rows where subject_user_id IN (NULL, uid)
+CREATE TABLE IF NOT EXISTS memories (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        INTEGER NOT NULL,
+    subject_user_id INTEGER,                       -- NULL = group-wide
+    content         TEXT NOT NULL,                 -- free-form, LLM-authored
+    importance      REAL NOT NULL DEFAULT 0.5,     -- 0..1, LLM self-rated
+    tags            TEXT NOT NULL DEFAULT '',      -- space-joined keywords
+    trigger_at      REAL,                          -- unix ts; NULL = passive
+    recurrence      TEXT,                          -- NULL | 'daily HH:MM'
+    expires_at      REAL,
+    created_at      REAL NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|fired|cancelled
+    fired_at        REAL,
+    source_text     TEXT NOT NULL DEFAULT '',
+    source_nickname TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS memories_due
+    ON memories(status, trigger_at);
+CREATE INDEX IF NOT EXISTS memories_group_subject
+    ON memories(group_id, subject_user_id, expires_at);
 """
 
 
@@ -424,6 +449,208 @@ class Storage:
                 "DELETE FROM daily_recaps "
                 "WHERE day < date('now', ?)",
                 (f"-{keep_days} days",),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    # ---------- important memories ----------
+    async def memory_item_insert(
+        self,
+        *,
+        group_id: int,
+        subject_user_id: Optional[int],
+        content: str,
+        importance: float,
+        tags: str,
+        trigger_at: Optional[float],
+        recurrence: Optional[str],
+        expires_at: Optional[float],
+        created_at: float,
+        source_text: str,
+        source_nickname: str,
+    ) -> int:
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT INTO memories(group_id,subject_user_id,content,importance,"
+                " tags,trigger_at,recurrence,expires_at,created_at,status,"
+                " source_text,source_nickname)"
+                " VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)",
+                (
+                    group_id, subject_user_id, content[:500], float(importance),
+                    tags[:200], trigger_at, recurrence, expires_at, created_at,
+                    source_text[:500], source_nickname[:32],
+                ),
+            )
+            await self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    async def memory_item_due(
+        self, now_ts: float, limit: int = 50,
+    ) -> List[Tuple[int, int, Optional[int], str, str, Optional[str]]]:
+        """Pending items whose trigger_at <= now. Returns
+        (id, group_id, subject_user_id, content, source_nickname, recurrence)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,group_id,subject_user_id,content,source_nickname,recurrence "
+            "FROM memories WHERE status='pending' AND trigger_at IS NOT NULL "
+            "AND trigger_at<=? ORDER BY trigger_at ASC LIMIT ?",
+            (now_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), int(r[1]),
+             int(r[2]) if r[2] is not None else None,
+             str(r[3]), str(r[4]),
+             str(r[5]) if r[5] is not None else None)
+            for r in rows
+        ]
+
+    async def memory_item_mark_fired(
+        self, item_id: int, fired_at: float, next_trigger: Optional[float] = None,
+    ) -> None:
+        """Mark fired. If next_trigger given (recurring), reschedule instead."""
+        assert self._conn is not None
+        async with self._lock:
+            if next_trigger is not None:
+                await self._conn.execute(
+                    "UPDATE memories SET trigger_at=?, fired_at=? WHERE id=?",
+                    (next_trigger, fired_at, item_id),
+                )
+            else:
+                await self._conn.execute(
+                    "UPDATE memories SET status='fired', fired_at=? WHERE id=?",
+                    (fired_at, item_id),
+                )
+            await self._conn.commit()
+
+    async def memory_item_cancel(self, item_id: int, group_id: int) -> bool:
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE memories SET status='cancelled' "
+                "WHERE id=? AND group_id=? AND status='pending'",
+                (item_id, group_id),
+            )
+            await self._conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def memory_item_recall(
+        self,
+        group_id: int,
+        subject_user_id: int,
+        now_ts: float,
+        limit: int = 8,
+    ) -> List[Tuple[int, Optional[int], str, float, str, Optional[float]]]:
+        """Rows relevant for context injection. Returns
+        (id, subject_user_id, content, importance, tags, trigger_at).
+        Ranks personal items above group-wide, then by importance × recency."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,subject_user_id,content,importance,tags,trigger_at "
+            "FROM memories WHERE group_id=? "
+            "AND status IN ('pending','fired') "
+            "AND (subject_user_id IS NULL OR subject_user_id=?) "
+            "AND (expires_at IS NULL OR expires_at>?) "
+            "ORDER BY "
+            "  (subject_user_id IS NULL) ASC, "      # personal first
+            "  importance DESC, "
+            "  created_at DESC "
+            "LIMIT ?",
+            (group_id, subject_user_id, now_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]),
+             int(r[1]) if r[1] is not None else None,
+             str(r[2]), float(r[3]), str(r[4]),
+             float(r[5]) if r[5] is not None else None)
+            for r in rows
+        ]
+
+    async def memory_item_list_pending(
+        self, group_id: int, subject_user_id: Optional[int] = None, limit: int = 20,
+    ) -> List[Tuple[int, Optional[int], str, Optional[float], Optional[str]]]:
+        """Pending items for /remember list. Returns (id, subject_user_id,
+        content, trigger_at, recurrence)."""
+        assert self._conn is not None
+        if subject_user_id is None:
+            sql = ("SELECT id,subject_user_id,content,trigger_at,recurrence "
+                   "FROM memories WHERE group_id=? AND status='pending' "
+                   "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?")
+            params = (group_id, limit)
+        else:
+            sql = ("SELECT id,subject_user_id,content,trigger_at,recurrence "
+                   "FROM memories WHERE group_id=? AND status='pending' "
+                   "AND (subject_user_id IS NULL OR subject_user_id=?) "
+                   "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?")
+            params = (group_id, subject_user_id, limit)
+        async with self._conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]),
+             int(r[1]) if r[1] is not None else None,
+             str(r[2]),
+             float(r[3]) if r[3] is not None else None,
+             str(r[4]) if r[4] is not None else None)
+            for r in rows
+        ]
+
+    async def memory_item_expire(self, now_ts: float) -> int:
+        """Cancel rows past their expires_at. Returns rows touched."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE memories SET status='cancelled' "
+                "WHERE status='pending' AND expires_at IS NOT NULL "
+                "AND expires_at<=?",
+                (now_ts,),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    async def memory_item_prune(self, keep_days: int) -> int:
+        """Hard-delete fired/cancelled rows older than keep_days."""
+        assert self._conn is not None
+        cutoff = __import__("time").time() - keep_days * 86400
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM memories WHERE status IN ('fired','cancelled') "
+                "AND COALESCE(fired_at, created_at) < ?",
+                (cutoff,),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    async def memory_item_dedup_candidates(
+        self, group_id: int, limit: int = 50,
+    ) -> List[Tuple[int, Optional[int], str, str, float]]:
+        """Recent pending+fired items in this group, for the LLM dedup pass.
+        Returns (id, subject_user_id, content, tags, created_at)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,subject_user_id,content,tags,created_at "
+            "FROM memories WHERE group_id=? AND status IN ('pending','fired') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (group_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]),
+             int(r[1]) if r[1] is not None else None,
+             str(r[2]), str(r[3]), float(r[4]))
+            for r in rows
+        ]
+
+    async def memory_item_delete_many(self, ids: List[int]) -> int:
+        if not ids:
+            return 0
+        assert self._conn is not None
+        qs = ",".join("?" * len(ids))
+        async with self._lock:
+            cur = await self._conn.execute(
+                f"DELETE FROM memories WHERE id IN ({qs})",
+                tuple(ids),
             )
             await self._conn.commit()
             return cur.rowcount or 0

@@ -59,9 +59,11 @@ class LongMemory:
         if not rows:
             log.info("long_memory: no rows for group=%s day=%s", group_id, day)
             return None
-        # Cap to keep LLM input bounded.
-        if len(rows) > 400:
-            rows = rows[-400:]
+        # Feed every row from the day to the LLM — truncating loses morning
+        # context for evening-heavy groups. Hard cap is a safety belt; storage
+        # already tops out at CONFIG.group_memory_max so this rarely trips.
+        if len(rows) > 3000:
+            rows = rows[-3000:]
         transcript = self._format_transcript(rows)
         try:
             reply = await self._deepseek.chat(

@@ -55,7 +55,7 @@ class Limits:
     auto_vision_group: int = _env_int("AUTO_VISION_DAILY_MAX", 100)
     rate_limit_per_min: int = _env_int("RATE_LIMIT_USER_PER_MIN", 15)
     max_reply_chars: int = _env_int("MAX_REPLY_CHARS", 1800)
-    max_history_turns: int = _env_int("MAX_HISTORY_TURNS", 8)
+    max_history_turns: int = _env_int("MAX_HISTORY_TURNS", 64)
 
 
 @dataclass
@@ -112,7 +112,7 @@ class Config:
     daily_recap_keep_days: int = _env_int("DAILY_RECAP_KEEP_DAYS", 365)
     # How many recent daily recaps to inject as "long memory" into each chat
     # call. 0 disables long-memory injection (but recaps are still saved).
-    long_memory_inject_days: int = _env_int("LONG_MEMORY_INJECT_DAYS", 3)
+    long_memory_inject_days: int = _env_int("LONG_MEMORY_INJECT_DAYS", 5)
 
     # Streaming. When true, DeepSeek replies are streamed in chunks into QQ.
     stream_replies: bool = (os.getenv("STREAM_REPLIES", "1") not in ("0", "false", "False"))
@@ -132,9 +132,9 @@ class Config:
 
     # ----- Group-wide memory (lets the bot "hear" the whole group) -----
     # Max rows kept per group (oldest pruned).
-    group_memory_max: int = _env_int("GROUP_MEMORY_MAX", 500)
+    group_memory_max: int = _env_int("GROUP_MEMORY_MAX", 1000)
     # How many recent group messages to inject into each chat call as context.
-    group_context_turns: int = _env_int("GROUP_CONTEXT_TURNS", 15)
+    group_context_turns: int = _env_int("GROUP_CONTEXT_TURNS", 40)
 
     # ----- Human-pacing of replies -----
     # Split each bot reply into N short messages with a random delay between
@@ -159,6 +159,19 @@ class Config:
     auto_vision_group_images: bool = (
         os.getenv("AUTO_VISION_GROUP_IMAGES", "0") not in ("0", "false", "False")
     )
+
+    # ----- Important-memory layer (LLM-judged facts / reminders / decisions) -----
+    important_memory_enabled: bool = (
+        os.getenv("IMPORTANT_MEMORY_ENABLED", "1") not in ("0", "false", "False")
+    )
+    # Top-N memories injected into each chat turn's system prompt. 0 disables
+    # context-injection (reminders still fire).
+    important_memory_recall_limit: int = _env_int("IMPORTANT_MEMORY_RECALL_LIMIT", 6)
+    # Reminder loop tick (seconds). 30 = up-to-30s late on a "9:00pm" reminder.
+    reminder_tick_seconds: int = _env_int("REMINDER_TICK_SECONDS", 30)
+    # Combined maintenance loop tick (seconds). Runs daily-recap refresh +
+    # memories dedup + expiry on every tick.
+    maintenance_tick_seconds: int = _env_int("MAINTENANCE_TICK_SECONDS", 1800)
 
     # ----- Proactive interjection -----
     # When a message is NOT addressed to the bot, the bot may occasionally
