@@ -16,6 +16,7 @@ import httpx
 from bot import allowlist
 from bot.group_memory import GroupMemory, GroupMsg
 from bot.emoji_filter import filter_emoji
+from bot.interjection_filter import filter_interjections
 from bot.image_utils import downscale_to_max, to_data_uri
 from bot.important_memory import ImportantMemory
 from bot.logger import get_logger
@@ -812,6 +813,12 @@ class Handler:
         pending = ""
         full = ""
         flush_at = CONFIG.stream_flush_chars
+
+        def _clean(piece: str) -> str:
+            piece = filter_emoji(piece, CONFIG.emoji_keep_probability)
+            piece = filter_interjections(piece)
+            return piece.strip()
+
         async for chunk in provider.chat_stream(messages, model=model, max_tokens=1200):
             pending += chunk
             full += chunk
@@ -821,16 +828,22 @@ class Handler:
                 if nl >= 0 and nl + 2 <= len(pending):
                     piece, pending = pending[: nl + 2], pending[nl + 2 :]
                     buf.append(piece)
-                    await self._reply(group_id, piece.strip())
+                    cleaned = _clean(piece)
+                    if cleaned:
+                        await self._reply(group_id, cleaned)
                     continue
                 if len(pending) >= flush_at:
                     piece, pending = pending[:flush_at], pending[flush_at:]
                     buf.append(piece)
-                    await self._reply(group_id, piece.strip())
+                    cleaned = _clean(piece)
+                    if cleaned:
+                        await self._reply(group_id, cleaned)
                     continue
                 break
         if pending.strip():
-            await self._reply(group_id, pending.strip())
+            cleaned = _clean(pending)
+            if cleaned:
+                await self._reply(group_id, cleaned)
         return full.strip() or "(空回复)"
 
     async def _check_quota(self, route: str, msg: ParsedMessage) -> bool:
@@ -880,6 +893,9 @@ class Handler:
         injection see the bot's voice as part of the conversation."""
         # Strip most emojis the LLM leaked through — they're the #1 AI tell.
         text = filter_emoji(text, CONFIG.emoji_keep_probability)
+        # Strip AI-ish 嘿嘿 / 诶呀 / 嘶 / 嗯嗯 — group history reinforces them and
+        # the persona alone can't suppress reliably.
+        text = filter_interjections(text)
         if not text.strip():
             return
 
