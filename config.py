@@ -191,10 +191,14 @@ class Config:
 
     # ----- Ambient engagement (post-router throttle for unaddressed chat) -----
     # When the router approves a NON-addressed message (no @, no nickname),
-    # roll this probability before actually replying. 1.0 disables the gate.
-    ambient_reply_probability: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY", "0.1"))
-    # Per-group minimum seconds between unaddressed replies. Directly-addressed
-    # messages (@ / nickname) bypass this entirely.
+    # roll a probability before actually replying. The router classifies the
+    # message into two tiers:
+    #   high = real question / call for opinion / clear conversational hook
+    #   low  = banter / reactions / off-topic / private convo between others
+    # 1.0 disables a gate. Directly-addressed messages bypass both gates.
+    ambient_reply_probability_high: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_HIGH", "0.4"))
+    ambient_reply_probability_low: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_LOW", "0.01"))
+    # Per-group minimum seconds between unaddressed replies. Applies to both tiers.
     ambient_reply_min_seconds: int = _env_int("AMBIENT_REPLY_MIN_SECONDS", 60)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()

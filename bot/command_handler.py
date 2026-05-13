@@ -468,30 +468,32 @@ class Handler:
 
         # Ambient gate: when the router approves a non-skip route but the
         # message wasn't directly addressed (no @, no nickname in text), throttle
-        # with a probability roll + per-group cooldown so the bot doesn't pile
-        # onto every conversation. Directly-addressed messages bypass entirely.
+        # with tier-specific probability + per-group cooldown so the bot doesn't
+        # pile onto every conversation. Directly-addressed messages bypass entirely.
         addressed = was_at_bot or (
             CONFIG.bot_nickname and CONFIG.bot_nickname in msg.text
         )
         if not addressed:
+            tier = decision.tier
+            p = (CONFIG.ambient_reply_probability_high if tier == "high"
+                 else CONFIG.ambient_reply_probability_low)
             elapsed = time.monotonic() - self._last_bot_speech_at.get(msg.group_id, 0.0)
             if elapsed < CONFIG.ambient_reply_min_seconds:
                 log.info(
-                    "ambient gate: cooldown %.1fs < %ds — skip",
-                    elapsed, CONFIG.ambient_reply_min_seconds,
+                    "ambient gate: cooldown %.1fs < %ds (tier=%s) — skip",
+                    elapsed, CONFIG.ambient_reply_min_seconds, tier,
                 )
                 self._last_dispatch_at.pop(msg.group_id, None)
                 return
-            if random.random() >= CONFIG.ambient_reply_probability:
+            if random.random() >= p:
                 log.info(
-                    "ambient gate: dice skip (p=%.2f)",
-                    CONFIG.ambient_reply_probability,
+                    "ambient gate: dice skip (tier=%s, p=%.2f)", tier, p,
                 )
                 self._last_dispatch_at.pop(msg.group_id, None)
                 return
             log.info(
-                "ambient gate: passed (p=%.2f, elapsed=%.1fs)",
-                CONFIG.ambient_reply_probability, elapsed,
+                "ambient gate: passed (tier=%s, p=%.2f, elapsed=%.1fs)",
+                tier, p, elapsed,
             )
 
         if route == "deepseek_chat":

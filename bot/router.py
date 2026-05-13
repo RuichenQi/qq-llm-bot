@@ -45,43 +45,58 @@ ROUTES = set(_ROUTE_MAP.values())
 # Built once at import. Stable string → DeepSeek prefix cache stays warm.
 def _build_system_prompt() -> str:
     return f"""You classify a single QQ group message. Output STRICT JSON only:
-{{"r":"<route>"}}
+{{"r":"<route>","t":"<tier>"}}
 
 The bot's nickname is: {CONFIG.bot_nickname}
 
 Routes:
-- chat: bot should respond, normal chat / translation / casual answer
-- think: bot should respond, harder reasoning or code
+- chat: normal chat / translation / casual answer
+- think: harder reasoning or code
 - gpt: user explicitly wants GPT / top quality
 - vision: explicit request to look at / describe / OCR / answer-based-on an image
 - image: explicit request to GENERATE an image
 - edit: explicit request to MODIFY an image
-- skip: bot shouldn't speak
+- skip: bot definitely shouldn't speak (use sparingly — see list below)
 - no: unsafe / illegal / impossible
 
-The bot may respond (any non-skip route) ONLY IF AT LEAST ONE holds:
-1. The text contains the tag "[at_bot=true]" (the user @-mentioned the bot)
-2. The text contains the bot's nickname "{CONFIG.bot_nickname}"
-3. The message is clearly addressed to the bot (greets it, asks for its opinion / help by role)
-4. The message is a sincere question or "ask the group" call that a friend in
-   the group would naturally answer ("早饭吃啥", "今天天气咋样", "有人懂xxx吗",
-   "你们觉得xxx好吃吗") — even without naming the bot
-5. A natural opening to riff on: interesting topic, story hook, casual
-   confession that invites a reaction ("我今天好累啊", "刚发现一家新店")
+Tier (downstream code uses this to throttle non-addressed replies):
+- high: the bot SHOULD plausibly engage. Use when AT LEAST ONE holds:
+   1. Text contains "[at_bot=true]" (user @-mentioned the bot)
+   2. Text contains the bot's nickname "{CONFIG.bot_nickname}"
+   3. Message is clearly addressed to the bot (greets it, asks for opinion/help by role)
+   4. Sincere question or "ask the group" call that a friend would naturally answer
+      ("早饭吃啥", "今天天气咋样", "有人懂xxx吗", "你们觉得xxx好吃吗")
+   5. Natural opening to riff on: interesting topic, story hook, casual
+      confession that invites a reaction ("我今天好累啊", "刚发现一家新店")
+- low: borderline / probably not engaged with — pure reactions ("666"/"嗯"/"哈"/
+   "23333"), banter between two specific users (含 @他人、紧接对话链), pure
+   statements / complaints with no question and no riff hook, generic chit-chat
+   the bot has no reason to interrupt. Downstream code will reply to these
+   very rarely; classify here rather than skipping so the bot can still occasionally
+   chime in like a real groupmate.
+- omit (or "high") for skip / no.
 
-Skip otherwise. In particular, ALWAYS skip:
-- Pure reactions / acknowledgements (嗯/哈/啊/666/23333/[emoji-only]/[punctuation-only])
-- Clearly a back-and-forth between two specific users (含 @他人、紧接对话链、显然在回别人的话)
-- Statements / observations / complaints with no question and no riff hook
-- Off-topic spam, copypasta, ads
-- Political / NSFW / heavy personal content the bot has no business jumping into
+skip ONLY for:
+- Explicit NSFW / illegal content
+- Ads, spam, copypasta promoting external products
+- Deeply personal / political / argumentative content the bot has no business in
+- Messages that are clearly addressed to a specific OTHER user (e.g. "@张三 ...")
+  with no overlap to the wider group
 
 CRITICAL — image / vision rules:
-- A bare image with empty or trivial text → skip (the user just shared a picture, not asked the bot anything).
-- "[image attached]" alone is NOT a vision request. Vision requires the user to ASK to look at the image ("看看这张图"/"这是啥"/"翻译一下图里的字").
+- A bare image with empty or trivial text → skip (just sharing a picture).
+- "[image attached]" alone is NOT a vision request. Vision requires an explicit
+  ask ("看看这张图"/"这是啥"/"翻译一下图里的字").
 - Conceptual talk about images ("你能看图吗", "你是怎么识别的") → chat, NOT vision.
 
-When uncertain between chat and skip → skip."""
+Examples:
+- "[at_bot=true] 翻译一下 hello" → {{"r":"chat","t":"high"}}
+- "{CONFIG.bot_nickname}你早饭吃啥" → {{"r":"chat","t":"high"}}
+- "有人知道这个咋调吗" → {{"r":"chat","t":"high"}}
+- "今天好累" → {{"r":"chat","t":"high"}}
+- "666" → {{"r":"chat","t":"low"}}
+- "@张三 你说的那个" → {{"r":"chat","t":"low"}}
+- "[image attached]" → {{"r":"skip"}}"""
 
 
 ROUTER_SYSTEM_PROMPT = _build_system_prompt()
@@ -93,9 +108,11 @@ class RouteDecision:
     confidence: float
     reason: str
     normalized_prompt: str
+    tier: str = "high"   # "high" | "low" — used to pick the ambient gate probability
 
 
 _JSON_RE = re.compile(r"\{[^}]*\}", re.DOTALL)
+_VALID_TIERS = {"high", "low"}
 
 
 def _coerce(text: str, fallback_prompt: str) -> RouteDecision:
@@ -114,8 +131,12 @@ def _coerce(text: str, fallback_prompt: str) -> RouteDecision:
         log.warning("router unknown code %r → skip", short)
         return RouteDecision("skip", 0.0, "unknown_code", fallback_prompt)
 
+    tier_raw = str(obj.get("t", "")).strip().lower()
+    tier = tier_raw if tier_raw in _VALID_TIERS else "low"  # default conservative
+
     return RouteDecision(
-        route=route, confidence=1.0, reason=short, normalized_prompt=fallback_prompt
+        route=route, confidence=1.0, reason=short,
+        normalized_prompt=fallback_prompt, tier=tier,
     )
 
 
@@ -171,8 +192,8 @@ class Router:
             return RouteDecision("skip", 0.0, "router_error", user_text)
 
         decision = _coerce(reply.text, user_text)
-        log.info("router %s (reason=%s, in_tokens=%s, out_tokens=%s)",
-                 decision.route, decision.reason,
+        log.info("router %s tier=%s (reason=%s, in_tokens=%s, out_tokens=%s)",
+                 decision.route, decision.tier, decision.reason,
                  reply.usage.get("prompt_tokens") if reply.usage else "?",
                  reply.usage.get("completion_tokens") if reply.usage else "?")
         return decision
