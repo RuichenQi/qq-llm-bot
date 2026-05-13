@@ -189,6 +189,14 @@ class Config:
     # Prevents firing back-to-back with a normal reply.
     proactive_min_new_messages: int = _env_int("PROACTIVE_MIN_NEW_MESSAGES", 3)
 
+    # ----- Ambient engagement (post-router throttle for unaddressed chat) -----
+    # When the router approves a NON-addressed message (no @, no nickname),
+    # roll this probability before actually replying. 1.0 disables the gate.
+    ambient_reply_probability: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY", "0.1"))
+    # Per-group minimum seconds between unaddressed replies. Directly-addressed
+    # messages (@ / nickname) bypass this entirely.
+    ambient_reply_min_seconds: int = _env_int("AMBIENT_REPLY_MIN_SECONDS", 60)
+
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     limits: Limits = field(default_factory=Limits)
 

@@ -50,33 +50,38 @@ def _build_system_prompt() -> str:
 The bot's nickname is: {CONFIG.bot_nickname}
 
 Routes:
-- chat: directed at bot, normal chat / translation / casual answer
-- think: directed at bot, harder reasoning or code
+- chat: bot should respond, normal chat / translation / casual answer
+- think: bot should respond, harder reasoning or code
 - gpt: user explicitly wants GPT / top quality
-- vision: directed at bot AND explicitly asks to look at / describe / OCR / answer-based-on an image
-- image: directed at bot AND asks to GENERATE an image
-- edit: directed at bot AND asks to MODIFY an image
-- skip: NOT addressed to bot — the default for almost anything
+- vision: explicit request to look at / describe / OCR / answer-based-on an image
+- image: explicit request to GENERATE an image
+- edit: explicit request to MODIFY an image
+- skip: bot shouldn't speak
 - no: unsafe / illegal / impossible
 
-A message is "directed at bot" ONLY IF AT LEAST ONE of these holds:
-1. The text contains the tag "[at_bot=true]" (system-injected when the user @-mentions the bot)
+The bot may respond (any non-skip route) ONLY IF AT LEAST ONE holds:
+1. The text contains the tag "[at_bot=true]" (the user @-mentioned the bot)
 2. The text contains the bot's nickname "{CONFIG.bot_nickname}"
-3. The message is unambiguously a request to the bot (e.g. greets the bot by role)
+3. The message is clearly addressed to the bot (greets it, asks for its opinion / help by role)
+4. The message is a sincere question or "ask the group" call that a friend in
+   the group would naturally answer ("早饭吃啥", "今天天气咋样", "有人懂xxx吗",
+   "你们觉得xxx好吃吗") — even without naming the bot
+5. A natural opening to riff on: interesting topic, story hook, casual
+   confession that invites a reaction ("我今天好累啊", "刚发现一家新店")
 
-If none of those hold → skip.
+Skip otherwise. In particular, ALWAYS skip:
+- Pure reactions / acknowledgements (嗯/哈/啊/666/23333/[emoji-only]/[punctuation-only])
+- Clearly a back-and-forth between two specific users (含 @他人、紧接对话链、显然在回别人的话)
+- Statements / observations / complaints with no question and no riff hook
+- Off-topic spam, copypasta, ads
+- Political / NSFW / heavy personal content the bot has no business jumping into
 
 CRITICAL — image / vision rules:
 - A bare image with empty or trivial text → skip (the user just shared a picture, not asked the bot anything).
 - "[image attached]" alone is NOT a vision request. Vision requires the user to ASK to look at the image ("看看这张图"/"这是啥"/"翻译一下图里的字").
 - Conceptual talk about images ("你能看图吗", "你是怎么识别的") → chat, NOT vision.
 
-Other → skip rules:
-- Pure reactions (嗯/哈/啊/666/[emoji-only]/[punctuation-only]) → skip
-- Statements, observations, banter between other users → skip
-- Generic questions thrown into the group without addressing the bot → skip
-
-When in doubt → skip."""
+When uncertain between chat and skip → skip."""
 
 
 ROUTER_SYSTEM_PROMPT = _build_system_prompt()

@@ -449,10 +449,11 @@ class Handler:
         return "\n".join(lines)
 
     async def _dispatch_llm_route(self, msg: ParsedMessage) -> None:
+        was_at_bot = msg.mentions(msg.self_id)
         decision = await self.router.decide(
             msg.text,
             has_image=msg.has_image,
-            was_at_bot=msg.mentions(msg.self_id),
+            was_at_bot=was_at_bot,
         )
         prompt = decision.normalized_prompt or msg.text
 
@@ -463,6 +464,35 @@ class Handler:
             # isn't unfairly blocked by a non-reply.
             self._last_dispatch_at.pop(msg.group_id, None)
             return
+
+        # Ambient gate: when the router approves a non-skip route but the
+        # message wasn't directly addressed (no @, no nickname in text), throttle
+        # with a probability roll + per-group cooldown so the bot doesn't pile
+        # onto every conversation. Directly-addressed messages bypass entirely.
+        addressed = was_at_bot or (
+            CONFIG.bot_nickname and CONFIG.bot_nickname in msg.text
+        )
+        if not addressed:
+            elapsed = time.monotonic() - self._last_bot_speech_at.get(msg.group_id, 0.0)
+            if elapsed < CONFIG.ambient_reply_min_seconds:
+                log.info(
+                    "ambient gate: cooldown %.1fs < %ds — skip",
+                    elapsed, CONFIG.ambient_reply_min_seconds,
+                )
+                self._last_dispatch_at.pop(msg.group_id, None)
+                return
+            if random.random() >= CONFIG.ambient_reply_probability:
+                log.info(
+                    "ambient gate: dice skip (p=%.2f)",
+                    CONFIG.ambient_reply_probability,
+                )
+                self._last_dispatch_at.pop(msg.group_id, None)
+                return
+            log.info(
+                "ambient gate: passed (p=%.2f, elapsed=%.1fs)",
+                CONFIG.ambient_reply_probability, elapsed,
+            )
+
         if route == "deepseek_chat":
             await self._run_deepseek_chat(msg, prompt)
         elif route == "deepseek_think":
@@ -1085,7 +1115,8 @@ class Handler:
     )
 
     _PROACTIVE_PERSONA_BLURB = (
-        "短句、口语化、可不用标点、偶尔语气词；不要自称 AI；不要列要点"
+        "短句、口语化、可不用标点；不要塞嘿嘿/诶呀/嘶/啦这类语气词凑可爱；"
+        "不要自称 AI；不要列要点"
     )
 
     def _proactive_gate_open(self, msg: ParsedMessage) -> bool:
