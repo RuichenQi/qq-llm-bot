@@ -43,7 +43,7 @@ HealthFn = Callable[[], object]
 QUOTA_EXCEEDED_MSG = "今天这个功能的额度用完了，请明天再试吧~"
 RATE_LIMITED_MSG = "你发得太快啦，先休息一下吧~"
 REJECT_MSG = "这个请求我没法处理~"
-ERROR_MSG = "Can someone tell RC there is a problem with my AI."
+ERROR_MSG = "Can someone tell R there is a problem with my AI."
 
 def _fmt_ago(ts: Optional[float], *, now: Optional[float] = None) -> str:
     if ts is None:
