@@ -57,7 +57,7 @@ def _make_handler(monkeypatch, *, judge_reply: str = '{"r":"skip"}'):
 
     router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image, was_at_bot=False):
+    async def decide(text, *, has_image, was_at_bot=False, has_file=False, **_kw):
         from bot.router import RouteDecision
         return RouteDecision("skip", 1.0, "skip", text)
 

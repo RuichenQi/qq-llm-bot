@@ -150,9 +150,10 @@ class Router:
         *,
         has_image: bool,
         was_at_bot: bool = False,
+        has_file: bool = False,
     ) -> RouteDecision:
         # Cheap pre-filter: a literal empty message can never be addressed at us.
-        if not user_text.strip() and not has_image:
+        if not user_text.strip() and not has_image and not has_file:
             return RouteDecision("skip", 1.0, "empty", user_text)
 
         # Hard rule: a bare image (no text, no @) is just someone sharing a
@@ -166,6 +167,16 @@ class Router:
             ):
                 log.info("router pre-skip: bare image without bot-direction")
                 return RouteDecision("skip", 1.0, "bare_image", user_text)
+
+        # Same rule for files: bare uploads (no text, no @) are just sharing.
+        if has_file and not was_at_bot:
+            stripped = user_text.strip()
+            if (
+                not stripped
+                or (len(stripped) < 6 and CONFIG.bot_nickname not in stripped)
+            ):
+                log.info("router pre-skip: bare file without bot-direction")
+                return RouteDecision("skip", 1.0, "bare_file", user_text)
 
         # Build the user-side prompt with optional system tags. The system
         # prompt stays byte-stable for cache hits; only this user line changes.

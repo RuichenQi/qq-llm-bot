@@ -12,7 +12,7 @@ from bot.command_handler import Handler
 from bot.logger import get_logger, setup_logging
 from bot.long_memory import LongMemory
 from bot.memory import Memory
-from bot.message_parser import QuotedMessage, parse_event
+from bot.message_parser import AttachedFile, QuotedMessage, parse_event
 from bot.onebot_client import OneBotClient
 from bot.quota import Quota
 from bot.rate_limit import RateLimiter
@@ -27,7 +27,7 @@ log = get_logger("main")
 
 
 def _extract_quoted(payload: Dict[str, Any]) -> Optional[QuotedMessage]:
-    """Pull text AND image URLs out of a get_msg response."""
+    """Pull text, image URLs, and file segments out of a get_msg response."""
     msg = payload.get("message")
     if isinstance(msg, str):
         text = msg.strip()
@@ -35,6 +35,7 @@ def _extract_quoted(payload: Dict[str, Any]) -> Optional[QuotedMessage]:
     if isinstance(msg, list):
         parts: list[str] = []
         urls: list[str] = []
+        files: list[AttachedFile] = []
         for seg in msg:
             t = seg.get("type")
             data = seg.get("data") or {}
@@ -44,10 +45,21 @@ def _extract_quoted(payload: Dict[str, Any]) -> Optional[QuotedMessage]:
                 u = data.get("url") or data.get("file")
                 if u:
                     urls.append(str(u))
+            elif t == "file":
+                try:
+                    size = int(data.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                files.append(AttachedFile(
+                    name=str(data.get("file") or data.get("name") or "file"),
+                    url=str(data.get("url") or ""),
+                    file_id=str(data.get("file_id") or data.get("id") or ""),
+                    size=size,
+                ))
         text = "".join(parts).strip()
-        if not text and not urls:
+        if not text and not urls and not files:
             return None
-        return QuotedMessage(text=text, image_urls=urls)
+        return QuotedMessage(text=text, image_urls=urls, files=files)
     raw = payload.get("raw_message")
     if isinstance(raw, str) and raw.strip():
         return QuotedMessage(text=raw.strip())
@@ -171,6 +183,11 @@ async def amain() -> int:
             return None
         return _extract_quoted(payload)
 
+    async def fetch_file_url(group_id: int, file_id: str) -> Optional[str]:
+        if client is None or not file_id:
+            return None
+        return await client.get_group_file_url(group_id, file_id)
+
     handler = Handler(
         deepseek=deepseek,
         openai=openai,
@@ -181,6 +198,7 @@ async def amain() -> int:
         send_text=send_text,
         send_image=send_image,
         fetch_reply=fetch_reply,
+        fetch_file_url=fetch_file_url,
         health_status=lambda: client.status() if client is not None else None,
     )
 

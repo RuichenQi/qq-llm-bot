@@ -64,7 +64,7 @@ def _make_handler(monkeypatch, *, deepseek_reply: str = "今天群里聊了吃�
 
     router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image, was_at_bot=False):
+    async def decide(text, *, has_image, was_at_bot=False, has_file=False, **_kw):
         from bot.router import RouteDecision
         return RouteDecision("deepseek_chat", 1.0, "chat", text)
 

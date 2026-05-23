@@ -103,7 +103,58 @@ CREATE INDEX IF NOT EXISTS memories_due
     ON memories(status, trigger_at);
 CREATE INDEX IF NOT EXISTS memories_group_subject
     ON memories(group_id, subject_user_id, expires_at);
+
+-- Lessons: unified durable knowledge the group has shared with the bot.
+-- Subsumes what used to live in the separate `memories` table — behavior
+-- rules, personal facts, group agreements, and scheduled reminders all
+-- live here so context-injection + reminder-firing read from one place.
+--
+-- kind ∈ {rule, fact, agreement, reminder, other}.
+--   rule       behavioral instruction the bot should follow
+--   fact       persistent attribute of a person or the group
+--   agreement  decision / plan the group reached
+--   reminder   passive "remember this" without a trigger time
+--   (rows with trigger_at set act as scheduled reminders regardless of kind)
+CREATE TABLE IF NOT EXISTS lessons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        INTEGER NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'rule',
+    subject_user_id INTEGER,                       -- NULL = group-wide
+    content         TEXT NOT NULL,                 -- 'rule' column kept for legacy reads
+    rule            TEXT NOT NULL DEFAULT '',      -- legacy mirror of content
+    importance      REAL NOT NULL DEFAULT 0.6,
+    tags            TEXT NOT NULL DEFAULT '',
+    trigger_at      REAL,                          -- unix ts; reminder firing
+    recurrence      TEXT,                          -- 'daily HH:MM' | NULL
+    expires_at      REAL,
+    source_user_id  INTEGER NOT NULL,
+    source_text     TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    last_used_at    REAL,
+    status          TEXT NOT NULL DEFAULT 'active',  -- active | revoked | fired
+    fired_at        REAL
+);
+CREATE INDEX IF NOT EXISTS lessons_by_group
+    ON lessons(group_id, status, importance DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS lessons_due
+    ON lessons(status, trigger_at);
+CREATE INDEX IF NOT EXISTS lessons_group_subject
+    ON lessons(group_id, subject_user_id, expires_at);
 """
+
+# Columns we add to lessons after the table was first created (v1) — applied
+# idempotently on every startup via _add_missing_columns(). Kept in code (not
+# SQL) so we can run the same logic against pre-existing databases.
+_LESSONS_NEW_COLUMNS = (
+    ("kind", "TEXT NOT NULL DEFAULT 'rule'"),
+    ("subject_user_id", "INTEGER"),
+    ("content", "TEXT NOT NULL DEFAULT ''"),
+    ("tags", "TEXT NOT NULL DEFAULT ''"),
+    ("trigger_at", "REAL"),
+    ("recurrence", "TEXT"),
+    ("expires_at", "REAL"),
+    ("fired_at", "REAL"),
+)
 
 
 class Storage:
@@ -151,8 +202,98 @@ class Storage:
         await self._conn.execute("PRAGMA synchronous=NORMAL;")
         await self._conn.executescript(_SCHEMA)
         await self._conn.commit()
+        await self._add_missing_lesson_columns()
         if migrate:
             await self._migrate_legacy_json()
+            await self._migrate_memories_into_lessons()
+
+    async def _add_missing_lesson_columns(self) -> None:
+        """Idempotent ALTER TABLE for any lesson columns added after the
+        initial v1 schema. Safe to run repeatedly."""
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(lessons)") as cur:
+            rows = await cur.fetchall()
+        existing = {str(r[1]) for r in rows}
+        for col, decl in _LESSONS_NEW_COLUMNS:
+            if col in existing:
+                continue
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE lessons ADD COLUMN {col} {decl}"
+                )
+            except aiosqlite.OperationalError as e:
+                log.warning("lessons ALTER skipped (%s): %s", col, e)
+        # Backfill: copy rule → content for any pre-unify rows that have one
+        # but not the other. Two-direction so legacy reads against `rule`
+        # still work.
+        try:
+            await self._conn.execute(
+                "UPDATE lessons SET content=rule "
+                "WHERE (content='' OR content IS NULL) AND rule<>''"
+            )
+            await self._conn.execute(
+                "UPDATE lessons SET rule=content "
+                "WHERE (rule='' OR rule IS NULL) AND content<>''"
+            )
+        except aiosqlite.OperationalError:
+            pass
+        await self._conn.commit()
+
+    async def _migrate_memories_into_lessons(self) -> None:
+        """One-time copy of pre-unify `memories` rows into the unified
+        `lessons` table. Idempotent — uses a sentinel tag to avoid re-copy."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+        ) as cur:
+            if not await cur.fetchone():
+                return
+        async with self._conn.execute(
+            "SELECT id,group_id,subject_user_id,content,importance,tags,"
+            " trigger_at,recurrence,expires_at,created_at,status,fired_at,"
+            " source_text,source_nickname "
+            "FROM memories"
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            return
+        copied = 0
+        for r in rows:
+            (
+                old_id, group_id, subject_user_id, content, importance, tags,
+                trigger_at, recurrence, expires_at, created_at, status,
+                fired_at, source_text, source_nickname,
+            ) = r
+            tag_str = (tags or "")
+            sentinel = f"_migrated_from_memories:{old_id}"
+            if sentinel in tag_str:
+                continue
+            tag_str = (tag_str + " " + sentinel).strip()
+            kind = "reminder" if trigger_at is not None else (
+                "fact" if subject_user_id is not None else "agreement"
+            )
+            # Best-effort: source_user_id is unknown for legacy rows; use 0.
+            try:
+                await self._conn.execute(
+                    "INSERT INTO lessons("
+                    "  group_id,kind,subject_user_id,content,rule,importance,"
+                    "  tags,trigger_at,recurrence,expires_at,source_user_id,"
+                    "  source_text,created_at,status,fired_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        group_id, kind, subject_user_id, content, content,
+                        float(importance or 0.6), tag_str, trigger_at,
+                        recurrence, expires_at, 0,
+                        (source_text or "")[:500], float(created_at or 0.0),
+                        str(status or "active"), fired_at,
+                    ),
+                )
+                copied += 1
+            except aiosqlite.OperationalError as e:
+                log.warning("memories→lessons skip id=%s: %s", old_id, e)
+        await self._conn.commit()
+        if copied:
+            log.info("migrated %d rows from memories → lessons", copied)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -654,6 +795,237 @@ class Storage:
             )
             await self._conn.commit()
             return cur.rowcount or 0
+
+    # ---------- lessons (unified rules + facts + agreements + reminders) ----------
+    async def lesson_insert(
+        self,
+        *,
+        group_id: int,
+        kind: str,
+        subject_user_id: Optional[int],
+        content: str,
+        importance: float,
+        tags: str,
+        trigger_at: Optional[float],
+        recurrence: Optional[str],
+        expires_at: Optional[float],
+        source_user_id: int,
+        source_text: str,
+        created_at: float,
+    ) -> int:
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT INTO lessons("
+                "  group_id,kind,subject_user_id,content,rule,importance,tags,"
+                "  trigger_at,recurrence,expires_at,source_user_id,source_text,"
+                "  created_at,status"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'active')",
+                (
+                    group_id, kind, subject_user_id, content[:500], content[:500],
+                    float(importance), tags[:200], trigger_at, recurrence,
+                    expires_at, source_user_id, source_text[:500], created_at,
+                ),
+            )
+            await self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    async def lesson_active_for_user(
+        self, group_id: int, subject_user_id: int, now_ts: float, limit: int = 12,
+    ) -> List[Tuple[int, str, Optional[int], str, float, str, Optional[float]]]:
+        """Active rows scoped to a user (personal first, then group-wide).
+        Returns (id, kind, subject_user_id, content, importance, tags, trigger_at)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,kind,subject_user_id,content,importance,tags,trigger_at "
+            "FROM lessons WHERE group_id=? "
+            "AND status='active' "
+            "AND (subject_user_id IS NULL OR subject_user_id=?) "
+            "AND (expires_at IS NULL OR expires_at>?) "
+            "ORDER BY "
+            "  CASE kind WHEN 'rule' THEN 0 ELSE 1 END ASC, "
+            "  (subject_user_id IS NULL) ASC, "
+            "  importance DESC, "
+            "  created_at DESC "
+            "LIMIT ?",
+            (group_id, subject_user_id, now_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), str(r[1]),
+             int(r[2]) if r[2] is not None else None,
+             str(r[3]), float(r[4]), str(r[5]),
+             float(r[6]) if r[6] is not None else None)
+            for r in rows
+        ]
+
+    async def lesson_list(
+        self, group_id: int, limit: int = 50,
+    ) -> List[Tuple[int, str, str, float, str, Optional[float], Optional[str]]]:
+        """All lessons for /admin. Returns
+        (id, kind, content, importance, status, trigger_at, recurrence)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,kind,content,importance,status,trigger_at,recurrence "
+            "FROM lessons WHERE group_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (group_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), str(r[1]), str(r[2]), float(r[3]), str(r[4]),
+             float(r[5]) if r[5] is not None else None,
+             str(r[6]) if r[6] is not None else None)
+            for r in rows
+        ]
+
+    async def lesson_list_pending(
+        self, group_id: int, subject_user_id: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Tuple[int, str, Optional[int], str, Optional[float], Optional[str]]]:
+        """Active reminders for /remember. Returns
+        (id, kind, subject_user_id, content, trigger_at, recurrence)."""
+        assert self._conn is not None
+        if subject_user_id is None:
+            sql = (
+                "SELECT id,kind,subject_user_id,content,trigger_at,recurrence "
+                "FROM lessons WHERE group_id=? AND status='active' "
+                "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?"
+            )
+            params: Tuple = (group_id, limit)
+        else:
+            sql = (
+                "SELECT id,kind,subject_user_id,content,trigger_at,recurrence "
+                "FROM lessons WHERE group_id=? AND status='active' "
+                "AND (subject_user_id IS NULL OR subject_user_id=?) "
+                "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?"
+            )
+            params = (group_id, subject_user_id, limit)
+        async with self._conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), str(r[1]),
+             int(r[2]) if r[2] is not None else None,
+             str(r[3]),
+             float(r[4]) if r[4] is not None else None,
+             str(r[5]) if r[5] is not None else None)
+            for r in rows
+        ]
+
+    async def lesson_due(
+        self, now_ts: float, limit: int = 50,
+    ) -> List[Tuple[int, int, Optional[int], str, str, Optional[str]]]:
+        """Active items whose trigger_at <= now. Returns
+        (id, group_id, subject_user_id, content, kind, recurrence)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,group_id,subject_user_id,content,kind,recurrence "
+            "FROM lessons WHERE status='active' AND trigger_at IS NOT NULL "
+            "AND trigger_at<=? ORDER BY trigger_at ASC LIMIT ?",
+            (now_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), int(r[1]),
+             int(r[2]) if r[2] is not None else None,
+             str(r[3]), str(r[4]),
+             str(r[5]) if r[5] is not None else None)
+            for r in rows
+        ]
+
+    async def lesson_mark_fired(
+        self, lesson_id: int, fired_at: float,
+        next_trigger: Optional[float] = None,
+    ) -> None:
+        """Mark fired (or reschedule for recurring rows)."""
+        assert self._conn is not None
+        async with self._lock:
+            if next_trigger is not None:
+                await self._conn.execute(
+                    "UPDATE lessons SET trigger_at=?, fired_at=? WHERE id=?",
+                    (next_trigger, fired_at, lesson_id),
+                )
+            else:
+                # One-shot reminders go to 'fired'; rules/facts with no trigger
+                # stay 'active' regardless. We only flip status when this row
+                # actually had a trigger_at (caller already filtered).
+                await self._conn.execute(
+                    "UPDATE lessons SET status='fired', fired_at=? "
+                    "WHERE id=? AND trigger_at IS NOT NULL",
+                    (fired_at, lesson_id),
+                )
+            await self._conn.commit()
+
+    async def lesson_revoke(self, lesson_id: int, group_id: int) -> bool:
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE lessons SET status='revoked' "
+                "WHERE id=? AND group_id=? AND status='active'",
+                (lesson_id, group_id),
+            )
+            await self._conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def lesson_revoke_many(self, ids: List[int], group_id: int) -> int:
+        if not ids:
+            return 0
+        assert self._conn is not None
+        qs = ",".join("?" * len(ids))
+        async with self._lock:
+            cur = await self._conn.execute(
+                f"UPDATE lessons SET status='revoked' "
+                f"WHERE group_id=? AND status='active' AND id IN ({qs})",
+                (group_id, *ids),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    async def lesson_expire(self, now_ts: float) -> int:
+        """Revoke rows past expires_at. Returns rows touched."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE lessons SET status='revoked' "
+                "WHERE status='active' AND expires_at IS NOT NULL "
+                "AND expires_at<=?",
+                (now_ts,),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    async def lesson_prune(self, keep_days: int) -> int:
+        """Hard-delete fired/revoked rows older than keep_days."""
+        assert self._conn is not None
+        cutoff = __import__("time").time() - keep_days * 86400
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM lessons WHERE status IN ('fired','revoked') "
+                "AND COALESCE(fired_at, created_at) < ?",
+                (cutoff,),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    async def lesson_dedup_candidates(
+        self, group_id: int, limit: int = 50,
+    ) -> List[Tuple[int, str, Optional[int], str, str, float]]:
+        """Recent active+fired items, for the LLM dedup pass.
+        Returns (id, kind, subject_user_id, content, tags, created_at)."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id,kind,subject_user_id,content,tags,created_at "
+            "FROM lessons WHERE group_id=? AND status IN ('active','fired') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (group_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (int(r[0]), str(r[1]),
+             int(r[2]) if r[2] is not None else None,
+             str(r[3]), str(r[4]), float(r[5]))
+            for r in rows
+        ]
 
     # ---------- daily report bookkeeping ----------
     async def report_mark_sent(self, day: str) -> bool:

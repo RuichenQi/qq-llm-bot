@@ -58,7 +58,7 @@ def _make_handler(monkeypatch) -> Tuple[Handler, List[Tuple[int, str]]]:
 
     router = types.SimpleNamespace()
 
-    async def decide(text, *, has_image, was_at_bot=False):
+    async def decide(text, *, has_image, was_at_bot=False, has_file=False, **_kw):
         from bot.router import RouteDecision
         return RouteDecision("deepseek_chat", 1.0, "stub", text)
 

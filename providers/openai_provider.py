@@ -192,6 +192,38 @@ class OpenAIProvider:
             model=CONFIG.openai_image_model,
         )
 
+    # ---------- audio transcription ----------
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.mp3",
+        model: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> TextReply:
+        """Whisper-style transcription. OpenAI's /audio/transcriptions endpoint."""
+        url = f"{CONFIG.openai_base_url.rstrip('/')}/audio/transcriptions"
+        files = {"file": (filename, audio_bytes, "application/octet-stream")}
+        data: Dict[str, str] = {"model": model or CONFIG.openai_audio_model}
+        if language:
+            data["language"] = language
+        headers = {"Authorization": f"Bearer {CONFIG.openai_api_key}"}
+        try:
+            resp = await self._client.post(
+                url, headers=headers, files=files, data=data,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"OpenAI transcribe network error: {e}") from e
+        if resp.status_code >= 400:
+            raise ProviderError(
+                f"OpenAI transcribe HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        payload = resp.json()
+        text = str(payload.get("text") or "").strip()
+        log.info("openai transcribe ok bytes_in=%d chars_out=%d",
+                 len(audio_bytes), len(text))
+        return TextReply(text=text, usage={}, model=data["model"])
+
     @staticmethod
     def b64_to_bytes(b64: str) -> bytes:
         return base64.b64decode(b64)

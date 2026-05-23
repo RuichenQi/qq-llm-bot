@@ -196,10 +196,48 @@ class Config:
     #   high = real question / call for opinion / clear conversational hook
     #   low  = banter / reactions / off-topic / private convo between others
     # 1.0 disables a gate. Directly-addressed messages bypass both gates.
-    ambient_reply_probability_high: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_HIGH", "0.4"))
-    ambient_reply_probability_low: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_LOW", "0.01"))
+    ambient_reply_probability_high: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_HIGH", "0.2"))
+    ambient_reply_probability_low: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_LOW", "0.001"))
     # Per-group minimum seconds between unaddressed replies. Applies to both tiers.
     ambient_reply_min_seconds: int = _env_int("AMBIENT_REPLY_MIN_SECONDS", 60)
+
+    # ----- Lessons (group-taught behavior rules) -----
+    # When ON, every addressed message (@bot or nickname-in-text) is also fed
+    # through a tiny LLM classifier that asks "is this teaching me a rule?".
+    # Confirmed rules go to the `lessons` table and are injected into the
+    # system prompt on every chat turn. Disable to save the round-trip per
+    # addressed message.
+    lessons_enabled: bool = (
+        os.getenv("LESSONS_ENABLED", "1") not in ("0", "false", "False")
+    )
+    lessons_inject_limit: int = _env_int("LESSONS_INJECT_LIMIT", 12)
+
+    # ----- Quoted-image intent gate -----
+    # When ON and a user replies to a message that contains an image, the bot
+    # first runs a cheap vision caption, then routes based on the user's text
+    # + caption. This stops the bot from auto-explaining images that the user
+    # is only using as a backdrop for a text question. Uses auto_vision quota.
+    quoted_image_intent_gate: bool = (
+        os.getenv("QUOTED_IMAGE_INTENT_GATE", "1") not in ("0", "false", "False")
+    )
+
+    # ----- File ingestion -----
+    # When a file is uploaded / attached, fetch + extract text, and inject as
+    # context (mirrors the image flow). Max ingest size in MB.
+    file_ingest_enabled: bool = (
+        os.getenv("FILE_INGEST_ENABLED", "1") not in ("0", "false", "False")
+    )
+    file_ingest_max_mb: int = _env_int("FILE_INGEST_MAX_MB", 20)
+    # Hard cap on extracted text length (chars) injected into the prompt.
+    file_ingest_max_chars: int = _env_int("FILE_INGEST_MAX_CHARS", 12000)
+    # Whisper transcription for audio files. Uses the OpenAI provider.
+    file_audio_transcribe: bool = (
+        os.getenv("FILE_AUDIO_TRANSCRIBE", "1") not in ("0", "false", "False")
+    )
+    openai_audio_model: str = os.getenv("OPENAI_AUDIO_MODEL", "whisper-1")
+    # Video files: extract up to N evenly-spaced frames + transcribe audio.
+    # Requires ffmpeg on PATH. 0 disables.
+    file_video_frame_count: int = _env_int("FILE_VIDEO_FRAME_COUNT", 4)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     limits: Limits = field(default_factory=Limits)

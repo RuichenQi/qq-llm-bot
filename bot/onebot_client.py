@@ -119,6 +119,27 @@ class OneBotClient:
             return None
         return resp.get("data") or None
 
+    async def get_group_file_url(
+        self, group_id: int, file_id: str, busid: int = 0,
+    ) -> Optional[str]:
+        """Resolve a group-file id to a fetchable URL. Tries common OneBot v11
+        APIs (NapCat / go-cqhttp variants) in turn — first hit wins."""
+        for action, params in (
+            ("get_group_file_url", {
+                "group_id": int(group_id), "file_id": file_id, "busid": busid,
+            }),
+            ("get_file", {"file_id": file_id}),
+        ):
+            resp = await self._call_api(action, params)
+            status = (resp.get("status") or "").lower()
+            if status not in ("ok", "async"):
+                continue
+            data = resp.get("data") or {}
+            url = data.get("url") or data.get("file_url") or data.get("file")
+            if url:
+                return str(url)
+        return None
+
     # ---------- forward (we dial out) ----------
     async def _run_forward(self) -> None:
         backoff = 1.0

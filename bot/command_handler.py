@@ -14,15 +14,16 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from bot import allowlist
+from bot import file_utils
 from bot.group_memory import GroupMemory, GroupMsg
 from bot.emoji_filter import filter_emoji
 from bot.interjection_filter import filter_interjections
 from bot.image_utils import downscale_to_max, to_data_uri
-from bot.important_memory import ImportantMemory
+from bot.lessons import Lessons
 from bot.logger import get_logger
 from bot.long_memory import LongMemory
 from bot.memory import Memory
-from bot.message_parser import ParsedMessage, QuotedMessage, chunk_text
+from bot.message_parser import AttachedFile, ParsedMessage, QuotedMessage, chunk_text
 from bot.persona import load_persona
 from bot.quota import Quota
 from bot.rate_limit import RateLimiter
@@ -38,6 +39,8 @@ SendText = Callable[[int, str], Awaitable[None]]
 SendImage = Callable[[int, str], Awaitable[None]]
 # Fetch the message referenced by [CQ:reply,id=...] (text + image URLs).
 FetchReply = Callable[[str], Awaitable[Optional[QuotedMessage]]]
+# Resolve a group-file id to a downloadable URL (adapter-specific).
+FetchFileUrl = Callable[[int, str], Awaitable[Optional[str]]]
 # Returns a `bot.onebot_client.WsStatus` (kept loose-typed to avoid the import cycle).
 HealthFn = Callable[[], object]
 
@@ -91,7 +94,8 @@ HELP_MSG = (
     "/edit <修改指令> 编辑最近一张图\n"
     "/recap [今天|昨天|1h|1d|一周]  总结群里活动\n"
     "/recall [YYYY-MM-DD|关键词]  查长时记忆\n"
-    "/remember [list|cancel <id>]  看/取消我帮你记的事\n"
+    "/remember [list|cancel <id>]  看/取消我帮你记的事（规则/事实/约定/提醒）\n"
+    "/file <问题>    上传文件后，问我关于文件的问题\n"
     "/reset           清空我和你的对话记忆\n"
     "/balance         查看今日额度\n"
     "/help            显示帮助\n"
@@ -126,12 +130,15 @@ class Handler:
     send_text: SendText
     send_image: SendImage
     fetch_reply: Optional[FetchReply] = None  # injected from main
+    fetch_file_url: Optional[FetchFileUrl] = None  # injected from main
     health_status: Optional[HealthFn] = None  # injected from main
     group_memory: GroupMemory = field(default_factory=GroupMemory)
     long_memory: Optional[LongMemory] = None
-    important_memory: Optional[ImportantMemory] = None
+    lessons: Optional[Lessons] = None
     _http: httpx.AsyncClient = field(default_factory=lambda: httpx.AsyncClient(timeout=60.0))
     _last_image: Dict[Tuple[int, int], _ImageMemo] = field(default_factory=dict)
+    # Cache: image-URL → short caption (for the quoted-image intent gate).
+    _image_caption_cache: Dict[str, str] = field(default_factory=dict)
     _last_dispatch_at: Dict[int, float] = field(default_factory=dict)
     # Proactive-interjection bookkeeping (per group).
     _last_bot_speech_at: Dict[int, float] = field(default_factory=dict)
@@ -140,8 +147,8 @@ class Handler:
     def __post_init__(self) -> None:
         if self.long_memory is None:
             self.long_memory = LongMemory(self.group_memory, self.deepseek)
-        if self.important_memory is None:
-            self.important_memory = ImportantMemory(self.deepseek)
+        if self.lessons is None:
+            self.lessons = Lessons(self.deepseek)
 
     # ---------- entry ----------
     async def handle(self, msg: ParsedMessage) -> None:
@@ -150,7 +157,7 @@ class Handler:
             return
         if msg.self_id == msg.user_id:
             return
-        if not msg.text and not msg.has_image:
+        if not msg.text and not msg.has_image and not msg.has_file:
             return
 
         # Log into group memory BEFORE any filtering — even messages we'll
@@ -158,7 +165,14 @@ class Handler:
         # background task) so downstream reads (proactive judge, /recap, chat
         # context injection) always see this row. Skip /commands; they're
         # bot-control plumbing, not conversation.
-        record_text = msg.text or ("[图片]" if msg.has_image else "")
+        if msg.text:
+            record_text = msg.text
+        elif msg.has_image:
+            record_text = "[图片]"
+        elif msg.has_file:
+            record_text = f"[文件:{msg.files[0].name}]"
+        else:
+            record_text = ""
         row_id = 0
         if record_text and not msg.is_command:
             row_id = await self.group_memory.append(
@@ -175,18 +189,6 @@ class Handler:
                 asyncio.create_task(self._caption_image_for_memory(
                     row_id, msg.group_id, msg.image_urls[0], msg.text or "",
                 ))
-            # Important-memory classifier: text-only messages run through the
-            # LLM judge so reminders / facts / decisions get persisted. Cheap
-            # regex pre-filter inside maybe_extract gates the LLM call.
-            if (
-                CONFIG.important_memory_enabled
-                and self.important_memory is not None
-                and msg.text
-            ):
-                asyncio.create_task(self._safe_extract_memory(
-                    msg.group_id, msg.user_id,
-                    msg.nickname or f"u{msg.user_id}", msg.text,
-                ))
         # Count toward "messages since bot spoke" for proactive interjection.
         self._msgs_since_bot_spoke[msg.group_id] = (
             self._msgs_since_bot_spoke.get(msg.group_id, 0) + 1
@@ -196,6 +198,23 @@ class Handler:
             asyncio.create_task(
                 self._cache_image_to_disk(msg.group_id, msg.user_id, msg.image_urls[0])
             )
+
+        # Unified lesson-learning: one LLM classifier decides whether the
+        # message holds a behavior rule, a personal fact, a group agreement,
+        # or a scheduled reminder — and persists it accordingly. Addressed
+        # messages (@bot or nickname) bypass the keyword pre-filter so a
+        # rule like "你说话简短点" still gets caught even without time/
+        # preference vocabulary.
+        if (
+            CONFIG.lessons_enabled
+            and self.lessons is not None
+            and msg.text
+            and not msg.is_command
+        ):
+            addressed = self._is_addressed(msg)
+            asyncio.create_task(self._safe_learn_lesson(
+                msg.group_id, msg.user_id, msg.text, addressed,
+            ))
 
         if not self._trigger_allows(msg):
             log.debug("trigger mode %s skipped: %r", CONFIG.trigger_mode, msg.text[:60])
@@ -243,19 +262,27 @@ class Handler:
                     msg.text = (
                         f"[被引用的消息]\n{quoted.text}\n\n[我的问题]\n{msg.text}"
                     ).strip()
-                # If the quote carried an image and this message didn't, treat
-                # the quoted image as the user's own attachment.
+                # If the quote carried an image and this message didn't, decide
+                # whether the user actually wants vision-level analysis of that
+                # image. Cheap caption first, then router judges based on text
+                # + caption. Stops the bot from auto-describing every quoted pic.
                 if quoted.image_urls and not msg.image_urls:
-                    msg.image_urls = list(quoted.image_urls)
+                    await self._handle_quoted_image(msg, quoted.image_urls)
+                # Pull files from quote so /file works for "reply + ask about
+                # that previous upload". Don't double-add if already attached.
+                if quoted.files and not msg.files:
+                    msg.files = list(quoted.files)
                     log.info(
-                        "reply-segment provided image(s); using %d from quoted msg",
-                        len(quoted.image_urls),
+                        "reply-segment provided file(s); using %d from quoted msg",
+                        len(quoted.files),
                     )
-                    asyncio.create_task(
-                        self._cache_image_to_disk(
-                            msg.group_id, msg.user_id, msg.image_urls[0]
-                        )
-                    )
+
+        # File ingestion: extract / transcribe and inject as system context.
+        if CONFIG.file_ingest_enabled and msg.has_file:
+            try:
+                await self._ingest_files(msg)
+            except Exception:
+                log.exception("file ingest crashed")
 
         try:
             if msg.is_command:
@@ -313,6 +340,8 @@ class Handler:
             await self._run_openai_vision(msg, args or msg.text)
         elif c == "edit":
             await self._run_openai_image_edit(msg, args or msg.text)
+        elif c == "file":
+            await self._run_file_qa(msg, args or msg.text)
         elif c == "recap":
             await self._run_recap(msg, args)
         elif c == "recall":
@@ -344,7 +373,9 @@ class Handler:
                 "/admin list_groups          显示所有允许的群\n"
                 "/admin report               立即推送一次日报\n"
                 "/admin ping                 OneBot 连接状态与最近心跳\n"
-                "/admin save_recap [day]     手动写入某天的长时记忆",
+                "/admin save_recap [day]     手动写入某天的长时记忆\n"
+                "/admin lessons              查看本群学到的行为规则\n"
+                "/admin forget_lesson <id>   忘记一条规则",
             )
             return
         if sub == "status":
@@ -405,6 +436,48 @@ class Handler:
         if sub == "ping":
             await self._reply(msg.group_id, self._format_ping())
             return
+        if sub == "lessons":
+            if self.lessons is None:
+                await self._reply(msg.group_id, "lessons 模块未启用")
+                return
+            rows = await self.lessons.list_all(msg.group_id, limit=50)
+            if not rows:
+                await self._reply(msg.group_id, "本群还没教过我什么~")
+                return
+            kind_label = {
+                "rule": "规则", "fact": "事实",
+                "agreement": "约定", "reminder": "提醒",
+            }
+            lines = [f"群 {msg.group_id} 学到的事项："]
+            for _id, kind, content, imp, status, trigger_at, recurrence in rows:
+                tag = "" if status == "active" else f" [{status}]"
+                t_part = ""
+                if trigger_at:
+                    t_part = (
+                        f" @{datetime.fromtimestamp(trigger_at).strftime('%m-%d %H:%M')}"
+                    )
+                if recurrence:
+                    t_part += f" ({recurrence})"
+                label = kind_label.get(kind, kind)
+                lines.append(
+                    f"#{_id} [{label}] ({imp:.2f}){tag}{t_part} {content}"
+                )
+            lines.append("\n忘掉: /admin forget_lesson <id>")
+            await self._reply(msg.group_id, "\n".join(lines))
+            return
+        if sub == "forget_lesson":
+            if self.lessons is None:
+                await self._reply(msg.group_id, "lessons 模块未启用")
+                return
+            if not rest.isdigit():
+                await self._reply(msg.group_id, "用法: /admin forget_lesson <id>")
+                return
+            ok = await self.lessons.cancel(int(rest), msg.group_id)
+            await self._reply(
+                msg.group_id,
+                f"已忘记 #{rest}" if ok else "没找到这条（或已经忘了）",
+            )
+            return
         if sub == "save_recap":
             # /admin save_recap [yesterday|today|YYYY-MM-DD]
             if self.long_memory is None:
@@ -455,6 +528,7 @@ class Handler:
             msg.text,
             has_image=msg.has_image,
             was_at_bot=was_at_bot,
+            has_file=msg.has_file,
         )
         prompt = decision.normalized_prompt or msg.text
 
@@ -617,6 +691,18 @@ class Handler:
         await self.quota.consume("openai_image_edit", msg.group_id, msg.user_id)
         await self._send_image_reply(msg.group_id, img)
 
+    async def _run_file_qa(self, msg: ParsedMessage, prompt: str) -> None:
+        """/file <question> — answer based on file content already injected
+        into msg.text by _ingest_files. If no file was attached, ask for one."""
+        if not msg.has_file:
+            await self._reply(msg.group_id, "请先发文件，再用 /file 提问哦")
+            return
+        # _ingest_files already ran upstream and prepended file content to
+        # msg.text. Just route through the standard text path so persona,
+        # lessons, group context, etc. all apply.
+        question = prompt.strip() or "请总结这份文件的主要内容"
+        await self._run_deepseek_chat(msg, question)
+
     # ---------- image cache ----------
     async def _cache_image_to_disk(self, group_id: int, user_id: int, url: str) -> None:
         """Eagerly fetch + write image bytes to data/images/<sha>.dat."""
@@ -654,6 +740,86 @@ class Handler:
         memo.cached_at = time.monotonic()
         self._last_image[key] = memo
         return data
+
+    async def _handle_quoted_image(
+        self, msg: ParsedMessage, image_urls: List[str],
+    ) -> None:
+        """Decide what to do with an image attached to a quoted message.
+
+        Default: caption it (cheap vision call) and inject the caption as text
+        context. Then strip the image from msg.image_urls so the router judges
+        intent from text alone — preventing the bot from auto-describing every
+        image someone happens to reply to.
+
+        Bypass cases (image is kept as a true vision input):
+          * /vision and /edit commands — explicit ask.
+          * QUOTED_IMAGE_INTENT_GATE disabled by config.
+        """
+        if not image_urls:
+            return
+        # Always cache; downstream (/vision /edit) needs the file on disk.
+        asyncio.create_task(
+            self._cache_image_to_disk(msg.group_id, msg.user_id, image_urls[0])
+        )
+        bypass = (
+            not CONFIG.quoted_image_intent_gate
+            or (msg.is_command and msg.command in ("vision", "edit"))
+        )
+        if bypass:
+            msg.image_urls = list(image_urls)
+            log.info(
+                "quoted image: bypass gate (cmd=%s gate=%s) — passing to vision",
+                msg.command if msg.is_command else "-",
+                CONFIG.quoted_image_intent_gate,
+            )
+            return
+        if self.openai is None:
+            # No vision provider — fall back to treating the image as input.
+            msg.image_urls = list(image_urls)
+            return
+        caption = await self._caption_quoted_image(msg.group_id, image_urls[0])
+        if caption:
+            msg.text = (
+                f"[被引用的图片大致内容: {caption}]\n{msg.text}"
+                if msg.text else
+                f"[被引用的图片大致内容: {caption}]"
+            ).strip()
+            log.info(
+                "quoted image: captioned (%d chars), routing on text+caption",
+                len(caption),
+            )
+        else:
+            # Caption failed — let routing see the image so vision can still
+            # answer if the text genuinely needs it.
+            msg.image_urls = list(image_urls)
+
+    async def _caption_quoted_image(
+        self, group_id: int, image_url: str,
+    ) -> Optional[str]:
+        """Low-cost one-line caption. Returns the caption or None on failure."""
+        if self.openai is None:
+            return None
+        ok, reason = await self.quota.check("auto_vision", group_id, 0)
+        if not ok:
+            log.info("quoted-image caption skipped: %s", reason)
+            return None
+        try:
+            raw = await self._download(image_url)
+            small = downscale_to_max(raw, CONFIG.max_vision_input_size)
+            data_uri = to_data_uri(small)
+            reply = await self.openai.vision(
+                "用中文一句话概括这张图（20字以内，只输出概括本身，不加标点）",
+                [data_uri],
+                max_tokens=60,
+            )
+        except Exception:
+            log.exception("quoted-image caption call failed")
+            return None
+        text = (reply.text or "").strip().split("\n")[0][:40]
+        if not text:
+            return None
+        await self.quota.consume("auto_vision", group_id, 0)
+        return text
 
     async def _caption_image_for_memory(
         self,
@@ -701,18 +867,163 @@ class Handler:
             return
         log.info("auto-caption ok group=%s caption=%r", group_id, caption)
 
-    async def _safe_extract_memory(
-        self, group_id: int, user_id: int, nickname: str, text: str,
+    # ---------- file ingestion ----------
+    async def _ingest_files(self, msg: ParsedMessage) -> None:
+        """Fetch each attached file, extract / transcribe / sample, and prepend
+        the result to msg.text so downstream routing treats it as context.
+
+        Mirrors the image flow: cheap, best-effort, gracefully degrades if
+        optional deps (pypdf, python-docx, ffmpeg) are missing.
+        """
+        if not msg.files:
+            return
+        # Cap to a few files per message to avoid runaway processing.
+        files = msg.files[:3]
+        blocks: List[str] = []
+        for f in files:
+            try:
+                block = await self._ingest_one_file(msg.group_id, msg.user_id, f)
+            except Exception:
+                log.exception("ingest_one_file crashed for %s", f.name)
+                block = f"[文件:{f.name}] 读取时出错了"
+            if block:
+                blocks.append(block)
+        if not blocks:
+            return
+        prefix = "\n\n".join(blocks)
+        msg.text = (prefix + "\n\n" + msg.text).strip() if msg.text else prefix
+
+    async def _ingest_one_file(
+        self, group_id: int, user_id: int, f: AttachedFile,
+    ) -> Optional[str]:
+        url = f.url
+        if not url and f.file_id and self.fetch_file_url is not None:
+            try:
+                url = await self.fetch_file_url(group_id, f.file_id) or ""
+            except Exception:
+                log.exception("fetch_file_url failed for %s", f.file_id)
+                url = ""
+        if not url:
+            return f"[文件:{f.name}]（拿不到下载链接）"
+
+        # Size pre-check via Content-Length (best-effort).
+        max_bytes = CONFIG.file_ingest_max_mb * 1024 * 1024
+        if 0 < max_bytes and f.size and f.size > max_bytes:
+            return f"[文件:{f.name}] 太大了（{f.size // (1024*1024)}MB > {CONFIG.file_ingest_max_mb}MB）"
+        try:
+            data = await self._download(url)
+        except httpx.HTTPError as e:
+            log.warning("file download failed %s: %s", f.name, e)
+            return f"[文件:{f.name}]（下载失败）"
+        if max_bytes and len(data) > max_bytes:
+            return f"[文件:{f.name}] 太大了，超过 {CONFIG.file_ingest_max_mb}MB 限制"
+        kind = file_utils.classify(f.name)
+        log.info(
+            "file ingest: name=%r kind=%s bytes=%d group=%s",
+            f.name, kind, len(data), group_id,
+        )
+        if kind == "audio":
+            return await self._ingest_audio(f, data)
+        if kind == "video":
+            return await self._ingest_video(group_id, f, data)
+        # text / code / pdf / docx / unsupported
+        extr = file_utils.extract_text(
+            f.name, data, max_chars=CONFIG.file_ingest_max_chars,
+        )
+        return file_utils.format_for_prompt(extr)
+
+    async def _ingest_audio(self, f: AttachedFile, data: bytes) -> str:
+        if not CONFIG.file_audio_transcribe or self.openai is None:
+            return f"[音频文件:{f.name}]（未启用语音转录）"
+        ext = Path(f.name).suffix.lower() or ".bin"
+        down = file_utils.downsample_audio(data, ext)
+        payload = down if down else data
+        try:
+            reply = await self.openai.transcribe(
+                payload, filename=file_utils.safe_name(f.name),
+            )
+        except ProviderError as e:
+            log.warning("audio transcribe failed: %s", e)
+            return f"[音频文件:{f.name}]（转录失败）"
+        text = (reply.text or "").strip()
+        if not text:
+            return f"[音频文件:{f.name}]（没识别出内容）"
+        if len(text) > CONFIG.file_ingest_max_chars:
+            text = text[: CONFIG.file_ingest_max_chars] + "…（已截断）"
+        return f"[音频文件 {f.name} 的语音内容]\n{text}"
+
+    async def _ingest_video(
+        self, group_id: int, f: AttachedFile, data: bytes,
+    ) -> str:
+        if self.openai is None:
+            return f"[视频文件:{f.name}]（未启用视觉/转录）"
+        ext = Path(f.name).suffix.lower() or ".mp4"
+        sections: List[str] = []
+        # Audio track → Whisper.
+        if CONFIG.file_audio_transcribe:
+            audio_bytes = file_utils.downsample_audio(data, ext)
+            if audio_bytes:
+                try:
+                    reply = await self.openai.transcribe(
+                        audio_bytes, filename="audio.mp3",
+                    )
+                    if reply.text.strip():
+                        snippet = reply.text.strip()
+                        if len(snippet) > 4000:
+                            snippet = snippet[:4000] + "…（已截断）"
+                        sections.append(f"语音内容：\n{snippet}")
+                except ProviderError as e:
+                    log.warning("video audio transcribe failed: %s", e)
+        # Frames → vision captions.
+        frame_count = CONFIG.file_video_frame_count
+        if frame_count > 0:
+            frames = file_utils.extract_video_frames(data, ext, frame_count)
+            captions: List[str] = []
+            for i, frame in enumerate(frames):
+                ok, _r = await self.quota.check("auto_vision", group_id, 0)
+                if not ok:
+                    break
+                try:
+                    small = downscale_to_max(frame, CONFIG.max_vision_input_size)
+                    data_uri = to_data_uri(small)
+                    cap = await self.openai.vision(
+                        "用中文一句话描述这张视频帧（20字以内）",
+                        [data_uri],
+                        max_tokens=60,
+                    )
+                except Exception:
+                    log.exception("video frame caption failed")
+                    continue
+                await self.quota.consume("auto_vision", group_id, 0)
+                text = (cap.text or "").strip().split("\n")[0][:40]
+                if text:
+                    captions.append(f"第{i + 1}帧：{text}")
+            if captions:
+                sections.append("画面要点：\n" + "\n".join(captions))
+        if not sections:
+            return f"[视频文件:{f.name}]（无法提取内容；可能缺少 ffmpeg）"
+        return f"[视频文件 {f.name}]\n" + "\n\n".join(sections)
+
+    def _is_addressed(self, msg: ParsedMessage) -> bool:
+        """True if the message clearly targets the bot — @-mention OR the bot's
+        nickname appears in the text. Used to gate lesson-learning."""
+        if msg.mentions(msg.self_id):
+            return True
+        nick = CONFIG.bot_nickname
+        return bool(nick) and nick in (msg.text or "")
+
+    async def _safe_learn_lesson(
+        self, group_id: int, user_id: int, text: str, addressed: bool,
     ) -> None:
-        """Background classifier wrapper that never raises."""
-        if self.important_memory is None:
+        if self.lessons is None:
             return
         try:
-            await self.important_memory.maybe_extract(
-                group_id=group_id, user_id=user_id, nickname=nickname, text=text,
+            await self.lessons.maybe_learn(
+                group_id=group_id, user_id=user_id, text=text,
+                addressed=addressed,
             )
         except Exception:
-            log.exception("important-memory extract failed")
+            log.exception("lesson learn failed")
 
     @staticmethod
     async def sweep_image_cache() -> None:
@@ -747,6 +1058,21 @@ class Handler:
         messages: List[ChatMessage] = [
             ChatMessage(role="system", content=load_persona()),
         ]
+        # Unified lessons: rules + facts + agreements + reminders injected
+        # right after persona so they shape every response. Personal items
+        # (subject_user_id=speaker) rank above group-wide ones.
+        if CONFIG.lessons_enabled and self.lessons is not None:
+            try:
+                active = await self.lessons.active_for_user(
+                    msg.group_id, msg.user_id,
+                    limit=CONFIG.lessons_inject_limit,
+                )
+            except Exception:
+                log.exception("lessons recall failed")
+                active = []
+            block = Lessons.format_for_prompt(active, speaker_user_id=msg.user_id)
+            if block:
+                messages.append(ChatMessage(role="system", content=block))
         # Long-term memory: most recent N daily recaps (cheap because each is
         # ~100 chars). Lets the bot vaguely reference "前几天" / "上周".
         if self.long_memory is not None and CONFIG.long_memory_inject_days > 0:
@@ -766,22 +1092,6 @@ class Handler:
                     group_ctx, bot_nickname=CONFIG.bot_nickname,
                 ),
             ))
-        # Inject important-memory recall: free-form facts/preferences/decisions
-        # the LLM classifier saved earlier. Personal items rank above group ones.
-        if (
-            CONFIG.important_memory_enabled
-            and self.important_memory is not None
-            and CONFIG.important_memory_recall_limit > 0
-        ):
-            mem_rows = await self.important_memory.recall_for_user(
-                msg.group_id, msg.user_id,
-                limit=CONFIG.important_memory_recall_limit,
-            )
-            mem_block = ImportantMemory.format_for_prompt(
-                mem_rows, speaker_user_id=msg.user_id,
-            )
-            if mem_block:
-                messages.append(ChatMessage(role="system", content=mem_block))
         for role, content in history:
             messages.append(ChatMessage(role=role, content=content))
         messages.append(ChatMessage(role="user", content=prompt))
@@ -870,23 +1180,59 @@ class Handler:
         return "\n".join(lines)
 
     # ---------- human-paced reply splitter ----------
-    _SENT_SPLIT_RE = re.compile(r"(?<=[。？！；.!?])\s*|(?:\n\s*\n)+")
+    # Split on:
+    #   1. Chinese sentence-end punct (。？！；) — split happens after the punct.
+    #   2. English "!" or "?" followed by whitespace.
+    #   3. English "." followed by whitespace, but NOT when the preceding char
+    #      is a digit (keeps decimals like "3.14" intact) and NOT before more
+    #      digits (handles "v1.2.3", "192.168.0.1"). Common abbreviations
+    #      ("Mr.", "Dr.") may still split — acceptable for chat output.
+    #   4. Paragraph breaks (one or more blank lines).
+    _SENT_SPLIT_RE = re.compile(
+        r"(?<=[。？！；])"
+        r"|(?<=[!?])\s+"
+        r"|(?<=[^\d]\.)\s+(?!\d)"
+        r"|(?:\n\s*\n)+"
+    )
+    # Drop trailing English periods and Chinese 句号 from each chunk per
+    # product spec ("句末不要加句号"). Other terminals (!?？！；…) are kept
+    # so emotional punctuation survives.
+    _TRAILING_PERIOD_RE = re.compile(r"[.。]+\s*$")
 
     @classmethod
     def _split_human_chunks(cls, text: str, max_chunks: int) -> List[str]:
-        """Split into 1..max_chunks short messages, splitting on sentence-end
-        punctuation or paragraph breaks. Never splits mid-sentence."""
+        """Split into 1..max_chunks short messages on sentence boundaries.
+
+        Decimals ("3.14") and version strings ("v1.2") are never broken.
+        Trailing periods on each chunk are stripped (English '.' and 句号)."""
         text = text.strip()
         if not text:
             return []
-        parts = [p.strip() for p in cls._SENT_SPLIT_RE.split(text) if p and p.strip()]
+        raw_parts = cls._SENT_SPLIT_RE.split(text)
+        parts: List[str] = []
+        for p in raw_parts:
+            if not p:
+                continue
+            stripped = p.strip()
+            if not stripped:
+                continue
+            stripped = cls._TRAILING_PERIOD_RE.sub("", stripped).rstrip()
+            if stripped:
+                parts.append(stripped)
         if not parts:
-            return [text]
+            return [cls._TRAILING_PERIOD_RE.sub("", text).rstrip()]
         if len(parts) <= max_chunks:
             return parts
-        # More sentences than chunks — distribute evenly.
+        # More sentences than chunks — distribute evenly, re-stripping the
+        # joined boundary so we don't reintroduce trailing periods.
         per = -(-len(parts) // max_chunks)  # ceil div
-        return ["".join(parts[i:i + per]) for i in range(0, len(parts), per)]
+        grouped: List[str] = []
+        for i in range(0, len(parts), per):
+            joined = "".join(parts[i:i + per])
+            joined = cls._TRAILING_PERIOD_RE.sub("", joined).rstrip()
+            if joined:
+                grouped.append(joined)
+        return grouped
 
     async def _human_send(self, group_id: int, text: str, *, log_to_memory: bool = True) -> None:
         """Send `text` as 1..N short messages with random delays between them.
@@ -906,10 +1252,11 @@ class Handler:
         self._msgs_since_bot_spoke[group_id] = 0
 
         if not CONFIG.human_send_enabled:
-            await self._reply(group_id, text)
+            single = self._TRAILING_PERIOD_RE.sub("", text).rstrip()
+            await self._reply(group_id, single)
             if log_to_memory:
                 asyncio.create_task(self.group_memory.append(
-                    group_id, 0, CONFIG.bot_nickname, text,
+                    group_id, 0, CONFIG.bot_nickname, single,
                 ))
             return
 
@@ -1012,9 +1359,10 @@ class Handler:
         await self._reply(msg.group_id, "\n\n".join(lines))
 
     async def _run_remember(self, msg: ParsedMessage, args: str) -> None:
-        """List / cancel important memories. Defaults to listing for caller."""
-        if not CONFIG.important_memory_enabled or self.important_memory is None:
-            await self._reply(msg.group_id, "重要记忆功能没开~")
+        """List / cancel pending lessons (reminders + facts + agreements +
+        rules). Now backed by the unified `lessons` table."""
+        if not CONFIG.lessons_enabled or self.lessons is None:
+            await self._reply(msg.group_id, "功能注入未启用~")
             return
         parts = args.strip().split(maxsplit=1)
         sub = parts[0].lower() if parts else "list"
@@ -1023,14 +1371,14 @@ class Handler:
             if not rest.isdigit():
                 await self._reply(msg.group_id, "用法: /remember cancel <id>")
                 return
-            ok = await self.important_memory.cancel(int(rest), msg.group_id)
+            ok = await self.lessons.cancel(int(rest), msg.group_id)
             await self._reply(
                 msg.group_id,
                 "已取消~" if ok else "找不到这条，或者已经取消/触发过了",
             )
             return
         if sub in ("", "list"):
-            rows = await self.important_memory.list_pending(
+            rows = await self.lessons.list_pending(
                 msg.group_id, msg.user_id, limit=15,
             )
             if not rows:
@@ -1038,7 +1386,7 @@ class Handler:
                 return
             lines = ["我记着的事："]
             now_ts = time.time()
-            for item_id, subj, content, trigger, recurrence in rows:
+            for item_id, kind, subj, content, trigger, recurrence in rows:
                 who = "（你）" if subj == msg.user_id else (
                     "（群）" if subj is None else f"（u{subj}）"
                 )
@@ -1059,7 +1407,7 @@ class Handler:
                         )
                 if recurrence:
                     t_part += f" ({recurrence})"
-                lines.append(f"#{item_id} {who} {content}{t_part}")
+                lines.append(f"#{item_id} [{kind}]{who} {content}{t_part}")
             lines.append("\n取消: /remember cancel <id>")
             await self._reply(msg.group_id, "\n".join(lines))
             return
@@ -1241,19 +1589,20 @@ class Handler:
     # ---------- reminder firing ----------
     async def fire_due_reminders(self) -> int:
         """Send any due reminders. Called by the periodic loop in main.py.
-        Returns number of reminders fired."""
-        if not CONFIG.important_memory_enabled or self.important_memory is None:
+        Reads from the unified `lessons` table; rows with `trigger_at <= now`
+        and status='active' are fired (and rescheduled if recurring)."""
+        if not CONFIG.lessons_enabled or self.lessons is None:
             return 0
         try:
-            due = await self.important_memory.due_reminders()
+            due = await self.lessons.due_reminders()
         except Exception:
-            log.exception("due_reminders query failed")
+            log.exception("lesson due_reminders query failed")
             return 0
         fired = 0
-        for item_id, group_id, subject_user_id, content, _src_nick, recurrence in due:
+        for item_id, group_id, subject_user_id, content, _kind, recurrence in due:
             if not await allowlist.is_allowed(group_id):
-                # Group de-allowed since the memory was created — drop the row.
-                await self.important_memory.cancel(item_id, group_id)
+                # Group de-allowed since the lesson was created — drop the row.
+                await self.lessons.cancel(item_id, group_id)
                 continue
             try:
                 # Compose the reminder body. If we know who it's for, @-mention.
@@ -1262,7 +1611,7 @@ class Handler:
                 else:
                     body = content
                 await self.send_text(group_id, body)
-                await self.important_memory.mark_fired(item_id, recurrence)
+                await self.lessons.mark_fired(item_id, recurrence)
                 fired += 1
                 log.info(
                     "reminder fired id=%s group=%s subject=%s recur=%s",
@@ -1306,16 +1655,19 @@ class Handler:
                     log.info("maintenance: pruned %d old recap rows", pruned)
             except Exception:
                 log.exception("maintenance: recap prune failed")
-        # Memories dedup + expiry.
+        # Unified lessons maintenance: expire stale rows + LLM-driven dedup
+        # of duplicates / contradictions. Replaces the old important_memory
+        # maintenance pass entirely (and any lessons-v1 dedup that lived here
+        # before the merge).
         if (
-            CONFIG.important_memory_enabled
-            and self.important_memory is not None
+            CONFIG.lessons_enabled
+            and self.lessons is not None
             and groups
         ):
             try:
-                await self.important_memory.maintenance_pass(groups)
+                await self.lessons.maintenance_pass(groups)
             except Exception:
-                log.exception("maintenance: memory pass failed")
+                log.exception("maintenance: lessons pass failed")
 
     async def aclose(self) -> None:
         await self._http.aclose()
