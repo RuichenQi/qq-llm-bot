@@ -289,13 +289,15 @@ class Lessons:
             subj_raw = None
         subject_user_id: Optional[int]
         if subj_raw is None:
-            # Facts default to the speaker — they nearly always describe "me".
-            # Rules / agreements stay group-wide.
-            subject_user_id = default_user_id if kind == "fact" else None
+            # Explicit null means "no subject / group-wide". Don't silently
+            # fill in the speaker — the classifier had its chance to assign.
+            subject_user_id = None
         else:
             try:
                 subject_user_id = int(subj_raw)
             except (TypeError, ValueError):
+                # Garbage value (e.g. a string) → fall back to speaker for
+                # facts (they describe a person), None otherwise.
                 subject_user_id = default_user_id if kind == "fact" else None
         trigger_at = _parse_iso_local(obj.get("trigger_at"))
         if trigger_at is not None and trigger_at <= time.time():

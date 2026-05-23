@@ -33,3 +33,27 @@ async def remove(group_id: int) -> bool:
         return False  # env-pinned, can't remove at runtime
     store = await Storage.get()
     return await store.groups_remove(group_id)
+
+
+# ---------- per-group pause (toggled by /stop and /start) ----------
+async def is_paused(group_id: int) -> bool:
+    store = await Storage.get()
+    return await store.group_pause_is_set(group_id)
+
+
+async def pause(group_id: int, by_user_id: int) -> bool:
+    """Silence the bot in this group. Returns True if it actually changed
+    state (False = already paused)."""
+    store = await Storage.get()
+    return await store.group_pause_set(group_id, by_user_id)
+
+
+async def resume(group_id: int) -> bool:
+    """Lift the pause. Returns True if a pause was actually cleared."""
+    store = await Storage.get()
+    return await store.group_pause_clear(group_id)
+
+
+async def all_paused_groups() -> Set[int]:
+    store = await Storage.get()
+    return set(await store.group_pause_list())

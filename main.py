@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import signal
 import sys
 from datetime import datetime, timedelta
@@ -22,6 +23,7 @@ from config import CONFIG
 from providers.base import ProviderError
 from providers.deepseek import DeepSeekProvider
 from providers.openai_provider import OpenAIProvider
+from providers.web_search import build_provider as build_web_search
 
 log = get_logger("main")
 
@@ -122,9 +124,37 @@ async def _maintenance_loop(handler: Handler) -> None:
             await asyncio.sleep(60)
 
 
+async def _dream_loop(handler: Handler) -> None:
+    """Overnight ambient: fire `handler.maybe_send_dream()` with low
+    probability during the configured local-time window. Cheap (one
+    deepseek_chat per dream) and bounded by the per-tick coin flip."""
+    if not CONFIG.dream_enabled:
+        return
+    period = max(300, CONFIG.dream_check_interval_seconds)
+    log.info(
+        "dream loop tick every %ds (hours [%d,%d), p=%.2f)",
+        period, CONFIG.dream_hour_start, CONFIG.dream_hour_end,
+        CONFIG.dream_probability,
+    )
+    while True:
+        try:
+            await asyncio.sleep(period)
+            hour = datetime.now().hour
+            if not (CONFIG.dream_hour_start <= hour < CONFIG.dream_hour_end):
+                continue
+            if random.random() >= CONFIG.dream_probability:
+                continue
+            await handler.maybe_send_dream()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("dream loop iteration failed")
+            await asyncio.sleep(60)
+
+
 async def _reminder_loop(handler: Handler) -> None:
-    """Fire due reminders from the important-memory layer."""
-    if not CONFIG.important_memory_enabled:
+    """Fire due reminders from the unified lessons layer."""
+    if not CONFIG.lessons_enabled:
         return
     period = max(10, CONFIG.reminder_tick_seconds)
     log.info("reminder loop tick every %ds", period)
@@ -188,6 +218,10 @@ async def amain() -> int:
             return None
         return await client.get_group_file_url(group_id, file_id)
 
+    web_search = build_web_search()
+    if web_search is not None:
+        log.info("web search backend enabled: %s", web_search.name)
+
     handler = Handler(
         deepseek=deepseek,
         openai=openai,
@@ -199,6 +233,7 @@ async def amain() -> int:
         send_image=send_image,
         fetch_reply=fetch_reply,
         fetch_file_url=fetch_file_url,
+        web_search=web_search,
         health_status=lambda: client.status() if client is not None else None,
     )
 
@@ -231,6 +266,7 @@ async def amain() -> int:
     sweeper_task = asyncio.create_task(_image_sweeper(), name="image_sweeper")
     maint_task = asyncio.create_task(_maintenance_loop(handler), name="maintenance")
     reminder_task = asyncio.create_task(_reminder_loop(handler), name="reminders")
+    dream_task = asyncio.create_task(_dream_loop(handler), name="dreams")
     stop_task = asyncio.create_task(stop_event.wait(), name="stop_wait")
 
     try:
@@ -240,13 +276,18 @@ async def amain() -> int:
     finally:
         await client.stop()
         for t in (run_task, stop_task, report_task, sweeper_task,
-                  maint_task, reminder_task):
+                  maint_task, reminder_task, dream_task):
             if not t.done():
                 t.cancel()
         await handler.aclose()
         await deepseek.aclose()
         if openai is not None:
             await openai.aclose()
+        if web_search is not None and hasattr(web_search, "aclose"):
+            try:
+                await web_search.aclose()
+            except Exception:
+                log.exception("web_search aclose failed")
         store = await Storage.get()
         await store.close()
 

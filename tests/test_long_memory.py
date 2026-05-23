@@ -192,7 +192,9 @@ def test_long_memory_zero_days_skips_injection(monkeypatch):
     asyncio.run(run())
     asyncio.run(handler.aclose())
     sys_content = "\n".join(m.content for m in captured[-1] if m.role == "system")
-    assert "长时记忆" not in sys_content
+    # Persona text mentions "长时记忆" as part of /recall's description; what we
+    # care about is that the *injected* long-memory block header is absent.
+    assert "你的长时记忆（最近几天群里的事" not in sys_content
 
 
 # ---------- /recall ----------

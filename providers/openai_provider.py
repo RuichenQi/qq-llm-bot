@@ -12,7 +12,8 @@ import httpx
 
 from bot.logger import get_logger
 from config import CONFIG
-from providers.base import ChatMessage, ImageReply, ProviderError, TextReply
+from providers.base import ChatMessage, ImageReply, ProviderError, TextReply, ToolCall
+from providers.deepseek import _message_to_wire, _parse_tool_calls
 
 log = get_logger(__name__)
 
@@ -41,10 +42,11 @@ class OpenAIProvider:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> TextReply:
         body: Dict[str, Any] = {
             "model": model or CONFIG.openai_text_model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_message_to_wire(m) for m in messages],
             "temperature": temperature,
             "stream": False,
         }
@@ -52,6 +54,8 @@ class OpenAIProvider:
             body["max_tokens"] = max_tokens
         if response_format:
             body["response_format"] = response_format
+        if tools:
+            body["tools"] = tools
 
         url = f"{CONFIG.openai_base_url.rstrip('/')}/chat/completions"
         try:
@@ -62,15 +66,23 @@ class OpenAIProvider:
             raise ProviderError(f"OpenAI HTTP {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            choice = data["choices"][0]
+            msg = choice.get("message") or {}
+            text = msg.get("content") or ""
         except (KeyError, IndexError) as e:
             raise ProviderError(f"OpenAI malformed response: {e}") from e
+        tool_calls = _parse_tool_calls(msg.get("tool_calls"))
         usage = data.get("usage", {}) or {}
+        finish_reason = str(choice.get("finish_reason") or "")
         log.info(
-            "openai chat ok model=%s tokens_in=%s tokens_out=%s",
-            body["model"], usage.get("prompt_tokens"), usage.get("completion_tokens"),
+            "openai chat ok model=%s tokens_in=%s tokens_out=%s tools=%d finish=%s",
+            body["model"], usage.get("prompt_tokens"),
+            usage.get("completion_tokens"), len(tool_calls), finish_reason,
         )
-        return TextReply(text=text.strip(), usage=usage, model=body["model"])
+        return TextReply(
+            text=text.strip(), usage=usage, model=body["model"],
+            tool_calls=tool_calls, finish_reason=finish_reason,
+        )
 
     # ---------- vision ----------
     async def vision(

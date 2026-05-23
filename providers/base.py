@@ -6,9 +6,28 @@ from typing import Any, Dict, List, Optional, Protocol
 
 
 @dataclass
+class ToolCall:
+    """One function call the assistant wants us to execute on its behalf.
+
+    Mirrors the OpenAI tool_calls schema:
+        {"id": "...", "type": "function",
+         "function": {"name": "...", "arguments": "<json string>"}}
+    """
+    id: str
+    name: str
+    arguments: str = ""  # JSON-encoded args, per OpenAI spec
+
+
+@dataclass
 class ChatMessage:
-    role: str  # "system" | "user" | "assistant"
+    role: str  # "system" | "user" | "assistant" | "tool"
     content: str
+    # Optional fields used only on tool-use turns. Kept as Optional so all
+    # existing call sites that construct `ChatMessage(role, content)` keep
+    # working unchanged.
+    name: Optional[str] = None              # tool name (for role=="tool")
+    tool_call_id: Optional[str] = None      # links tool result → assistant tool_call
+    tool_calls: Optional[List[ToolCall]] = None  # assistant-side: calls being requested
 
 
 @dataclass
@@ -16,6 +35,10 @@ class TextReply:
     text: str
     usage: Dict[str, Any] = field(default_factory=dict)
     model: str = ""
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    # OpenAI finish_reason; "tool_calls" means the model asked us to run tools
+    # rather than producing a final answer.
+    finish_reason: str = ""
 
 
 @dataclass
@@ -41,6 +64,7 @@ class TextProvider(Protocol):
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> TextReply: ...
 
 

@@ -143,7 +143,7 @@ def test_router_skip_does_not_consume_cooldown(monkeypatch):
     # Both handle calls must share one event loop because aiosqlite binds
     # its worker thread to whichever loop opened the connection.
     async def both_calls():
-        async def decide_skip(text, *, has_image, was_at_bot=False):
+        async def decide_skip(text, *, has_image, was_at_bot=False, **_kw):
             from bot.router import RouteDecision
             return RouteDecision("skip", 1.0, "off_topic", text)
 
@@ -152,7 +152,7 @@ def test_router_skip_does_not_consume_cooldown(monkeypatch):
         assert sent == [], f"skip should be silent, got {sent}"
         assert 1 not in handler._last_dispatch_at
 
-        async def decide_chat(text, *, has_image, was_at_bot=False):
+        async def decide_chat(text, *, has_image, was_at_bot=False, **_kw):
             from bot.router import RouteDecision
             return RouteDecision("deepseek_chat", 1.0, "chat", text)
 

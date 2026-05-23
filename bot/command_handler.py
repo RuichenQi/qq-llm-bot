@@ -28,10 +28,12 @@ from bot.persona import load_persona
 from bot.quota import Quota
 from bot.rate_limit import RateLimiter
 from bot.router import Router
+from bot.tools import ToolContext, ToolRegistry, run_with_tools
 from config import CONFIG, IMAGE_DIR
 from providers.base import ChatMessage, ImageReply, ProviderError
 from providers.deepseek import DeepSeekProvider
 from providers.openai_provider import OpenAIProvider
+from providers.web_search import WebSearchProvider
 
 log = get_logger(__name__)
 
@@ -48,6 +50,40 @@ QUOTA_EXCEEDED_MSG = "今天这个功能的额度用完了，请明天再试吧~
 RATE_LIMITED_MSG = "你发得太快啦，先休息一下吧~"
 REJECT_MSG = "这个请求我没法处理~"
 ERROR_MSG = "Can someone tell R there is a problem with my AI."
+
+
+# Mainland-China politically sensitive keyword set used as a tool-level gate on
+# `web_search`. Persona handles the conversational dodge; this just stops the
+# bot from quietly pulling fresh content about these topics off the open web.
+# Tuned for terms that are unambiguously political — common everyday words
+# (中国 / 北京 / 上海) are NOT in here, since they're fine to search for in a
+# non-political context.
+_SENSITIVE_QUERY_RE = re.compile(
+    r"六四|天安门|8964|六4|"
+    r"习近平|李克强|李强|温家宝|江泽民|胡锦涛|"
+    r"中共|共产党|党中央|政治局|中央政府|"
+    r"文革|文化大革命|大跃进|反右|"
+    r"达赖|西藏独立|藏独|tibet\s*independ|"
+    r"维吾尔|新疆\s*(集中营|再教育营|压迫|种族)|xinjiang\s*camp|"
+    r"法轮功|falun\s*gong|"
+    r"刘晓波|艾未未|许志永|"
+    r"709\s*律师|维权人士|"
+    r"香港\s*(抗议|国安法|占中)|hong\s*kong\s*protest|"
+    r"台独|台湾独立|两岸统独|"
+    r"翻墙|vpn\s*(中国|大陆|墙)|gfw|防火长城|"
+    r"白纸\s*(运动|革命)|"
+    r"活摘\s*器官",
+    re.IGNORECASE,
+)
+
+
+def _query_is_blocked(query: str) -> bool:
+    """Belt-and-suspenders filter: refuse politically-sensitive web searches.
+
+    Keeps the bot's tool layer aligned with the persona's "don't discuss"
+    list even if the LLM tries to route around the system prompt.
+    """
+    return bool(_SENSITIVE_QUERY_RE.search(query or ""))
 
 def _fmt_ago(ts: Optional[float], *, now: Optional[float] = None) -> str:
     if ts is None:
@@ -86,20 +122,34 @@ def format_ws_status(status: object, *, now: Optional[float] = None) -> str:
 
 HELP_MSG = (
     "指令（都要 @我 才生效）：\n"
-    "/ask <问题>      普通对话\n"
-    "/think <问题>    深度推理\n"
-    "/gpt <问题>      用 GPT 回答（受额度）\n"
-    "/image <描述>    生成图片（受额度）\n"
-    "/vision <问题>   分析最近一张图\n"
-    "/edit <修改指令> 编辑最近一张图\n"
-    "/recap [今天|昨天|1h|1d|一周]  总结群里活动\n"
-    "/recall [YYYY-MM-DD|关键词]  查长时记忆\n"
-    "/remember [list|cancel <id>]  看/取消我帮你记的事（规则/事实/约定/提醒）\n"
-    "/file <问题>    上传文件后，问我关于文件的问题\n"
-    "/reset           清空我和你的对话记忆\n"
-    "/balance         查看今日额度\n"
-    "/help            显示帮助\n"
-    "（直接 @我 也行～）"
+    "—— 对话 ——\n"
+    "/ask <问题>           普通对话（DeepSeek）\n"
+    "/think <问题>         深度推理\n"
+    "/gpt <问题>           GPT 回答（受额度）\n"
+    "/search <关键词>      联网搜索 + 回答\n"
+    "—— 图片 ——\n"
+    "/image <描述>         生成图片（受额度）\n"
+    "/vision [问题]        分析最近一张图\n"
+    "/edit <修改指令>      编辑最近一张图\n"
+    "—— 文件 ——\n"
+    "/file [问题]          回答关于刚上传文件的问题\n"
+    "                       （支持 txt/pdf/docx/code/音频/视频）\n"
+    "—— 群记忆 ——\n"
+    "/recap [今天|昨天|1h|1d|一周]   总结群里活动\n"
+    "/recall [YYYY-MM-DD|关键词]    查长时记忆\n"
+    "/timewarp [一年前|半年前|YYYY-MM]  怀旧短文\n"
+    "/dream                让我现在做个梦（仅管理员）\n"
+    "—— 功能注入（规则/事实/约定/提醒）——\n"
+    "/teach <规则>         教我一条今后要遵守的规则\n"
+    "/remember [list|cancel <id>]   看/取消我记着的事\n"
+    "/forget <id>          忘掉一条（=/remember cancel <id>）\n"
+    "—— 杂项 ——\n"
+    "/start                让我在本群上线（仅管理员）\n"
+    "/stop                 让我在本群下线（仅管理员）\n"
+    "/reset                清空我和你的对话记忆\n"
+    "/balance              查看今日额度\n"
+    "/help                 显示帮助\n"
+    "（直接 @我 聊天也行～）"
 )
 
 
@@ -135,6 +185,10 @@ class Handler:
     group_memory: GroupMemory = field(default_factory=GroupMemory)
     long_memory: Optional[LongMemory] = None
     lessons: Optional[Lessons] = None
+    # Web search backend (Tavily etc.); None when not configured. Tools that
+    # want to search go through this; the LLM never sees the provider directly.
+    web_search: Optional[WebSearchProvider] = None
+    tools: ToolRegistry = field(default_factory=ToolRegistry)
     _http: httpx.AsyncClient = field(default_factory=lambda: httpx.AsyncClient(timeout=60.0))
     _last_image: Dict[Tuple[int, int], _ImageMemo] = field(default_factory=dict)
     # Cache: image-URL → short caption (for the quoted-image intent gate).
@@ -149,6 +203,83 @@ class Handler:
             self.long_memory = LongMemory(self.group_memory, self.deepseek)
         if self.lessons is None:
             self.lessons = Lessons(self.deepseek)
+        if CONFIG.tool_use_enabled:
+            self._register_builtin_tools()
+
+    def _register_builtin_tools(self) -> None:
+        """Register the bot's default tool palette. The web_search tool is
+        always registered (so the LLM can decide to use it) but gracefully
+        reports unavailable when the backend isn't configured."""
+        from bot.tools import Tool  # local import avoids cycle at module load
+
+        async def _web_search_handler(args, ctx):
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return "Error: missing required parameter 'query'"
+            # Belt-and-suspenders content gate: even if the LLM tries to dodge
+            # the persona's "don't discuss" rule by going through the search
+            # tool, refuse here. The returned message is itself benign so the
+            # LLM can integrate it into a graceful dodge.
+            if _query_is_blocked(query):
+                log.info("web_search blocked sensitive query: %r", query[:120])
+                return (
+                    "（这条搜索被规则拦截了，不要把它转述给用户；"
+                    "请用礼貌的话岔开话题，例如 '这个我不太懂呢，我们聊点别的吧'）"
+                )
+            max_results = args.get("max_results")
+            try:
+                n = int(max_results) if max_results is not None else CONFIG.web_search_max_results
+            except (TypeError, ValueError):
+                n = CONFIG.web_search_max_results
+            n = max(1, min(n, 10))
+            if self.web_search is None:
+                return (
+                    "Web search is not configured on this bot "
+                    "(set TAVILY_API_KEY or WEB_SEARCH_ENABLED=0)."
+                )
+            try:
+                results = await self.web_search.search(query, max_results=n)
+            except Exception as e:  # noqa: BLE001
+                log.warning("web_search tool failed: %s", e)
+                return f"Web search failed: {e}"
+            from providers.web_search import format_results
+            return format_results(results)
+
+        self.tools.register(Tool(
+            name="web_search",
+            description=(
+                "Search the web for current or specific information. Call this "
+                "whenever you need facts the model may not know — recent events, "
+                "real-time data, niche/specific named entities (people, brands, "
+                "places, products), or before generating/editing an image of a "
+                "particular real-world subject so you can ground the description. "
+                "Do NOT call for general knowledge, casual chat, or things you "
+                "already know well. "
+                "STRICTLY DO NOT search for mainland-China politically sensitive "
+                "topics (CCP leadership, June 4, Xinjiang/Tibet/Taiwan/Hong Kong "
+                "political issues, Falun Gong, dissidents, GFW/VPN, etc.) — those "
+                "are forbidden by the bot's persona rules and the tool will refuse. "
+                "Returns top results as title + URL + snippet."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The search query. Be specific — include disambiguating "
+                            "context (e.g. '雷军 外貌 风格 公开形象', not just '雷军')."
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (1-10). Default 5.",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=_web_search_handler,
+        ))
 
     # ---------- entry ----------
     async def handle(self, msg: ParsedMessage) -> None:
@@ -198,6 +329,28 @@ class Handler:
             asyncio.create_task(
                 self._cache_image_to_disk(msg.group_id, msg.user_id, msg.image_urls[0])
             )
+
+        # Per-group pause gate. When the group is paused, the bot stays silent
+        # in all routes — including lesson learning and the LLM router —
+        # except for three superuser-only escape hatches: `/start` (un-pause),
+        # `/stop` (so repeat-stops still get an ack), and `/admin` (ops). Group
+        # memory recording above already happened, so context survives the pause.
+        if await allowlist.is_paused(msg.group_id):
+            is_superuser = msg.user_id in CONFIG.superusers
+            allowed_while_paused = (
+                msg.is_command
+                and msg.command in ("start", "stop", "admin")
+                and is_superuser
+                and msg.mentions(msg.self_id)  # @bot still required
+            )
+            if not allowed_while_paused:
+                log.debug(
+                    "group %s paused — skipping (cmd=%s user=%s)",
+                    msg.group_id,
+                    msg.command if msg.is_command else "-",
+                    msg.user_id,
+                )
+                return
 
         # Unified lesson-learning: one LLM classifier decides whether the
         # message holds a behavior rule, a personal fact, a group agreement,
@@ -346,8 +499,26 @@ class Handler:
             await self._run_recap(msg, args)
         elif c == "recall":
             await self._run_recall(msg, args)
+        elif c == "timewarp":
+            await self._run_timewarp(msg, args)
         elif c == "remember":
             await self._run_remember(msg, args)
+        elif c == "forget":
+            # Alias for `/remember cancel <id>` so users can drop a lesson
+            # without remembering the longer form.
+            await self._run_remember(msg, f"cancel {args}".strip())
+        elif c == "search":
+            # Use args explicitly — falling back to msg.text would pass "/search"
+            # as the query when the user types the bare command.
+            await self._run_search(msg, args)
+        elif c == "teach":
+            await self._run_teach(msg, args)
+        elif c == "dream":
+            await self._run_dream(msg)
+        elif c == "start":
+            await self._run_start(msg)
+        elif c == "stop":
+            await self._run_stop(msg)
         elif c == "admin":
             await self._run_admin(msg, args)
         else:
@@ -363,7 +534,7 @@ class Handler:
         if sub in ("", "help"):
             await self._reply(
                 msg.group_id,
-                "/admin status               本群路由用量\n"
+                "/admin status               本群今日路由用量\n"
                 "/admin usage                所有群今日用量\n"
                 "/admin reset_quota          清空今日额度\n"
                 "/admin reset_memory <uid>   清空指定用户对话记忆\n"
@@ -374,8 +545,9 @@ class Handler:
                 "/admin report               立即推送一次日报\n"
                 "/admin ping                 OneBot 连接状态与最近心跳\n"
                 "/admin save_recap [day]     手动写入某天的长时记忆\n"
-                "/admin lessons              查看本群学到的行为规则\n"
-                "/admin forget_lesson <id>   忘记一条规则",
+                "/admin lessons              查看本群学到的行为规则/事实/约定\n"
+                "/admin forget_lesson <id>   忘掉一条 lesson\n"
+                "（普通指令：/help；任何超级用户也可以 /dream 强制做梦）",
             )
             return
         if sub == "status":
@@ -423,9 +595,11 @@ class Handler:
             return
         if sub == "list_groups":
             groups = sorted(await allowlist.all_allowed_groups())
-            lines = ["允许的群（* 表示固定在 env 中）："]
+            paused = await allowlist.all_paused_groups()
+            lines = ["允许的群（* = env 固定；⏸ = 被 /stop 暂停）："]
             for g in groups:
                 marker = " *" if g in CONFIG.allowed_groups else ""
+                marker += " ⏸" if g in paused else ""
                 lines.append(f"  {g}{marker}")
             await self._reply(msg.group_id, "\n".join(lines) if groups else "白名单是空的")
             return
@@ -690,6 +864,127 @@ class Handler:
             return
         await self.quota.consume("openai_image_edit", msg.group_id, msg.user_id)
         await self._send_image_reply(msg.group_id, img)
+
+    async def _run_search(self, msg: ParsedMessage, query: str) -> None:
+        """`/search <query>` — force a web search and present grounded results.
+
+        Pipes the user's query through the same web_search tool the LLM uses
+        internally, then sends the formatted query+results into deepseek_chat
+        so the persona / lessons / sensitive-content rules all still apply.
+        """
+        query = (query or "").strip()
+        if not query:
+            await self._reply(msg.group_id, "搜啥呀，告诉我关键词~")
+            return
+        if _query_is_blocked(query):
+            log.info("/search blocked sensitive query: %r", query[:120])
+            await self._human_send(msg.group_id, "这个我不太懂呢，我们聊点别的吧")
+            return
+        if self.web_search is None:
+            await self._human_send(
+                msg.group_id,
+                "联网搜索还没配置呢（管理员要去填 TAVILY_API_KEY）",
+            )
+            return
+        try:
+            results = await self.web_search.search(
+                query, max_results=CONFIG.web_search_max_results,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("/search call failed: %s", e)
+            await self._reply(msg.group_id, "搜索失败了，过会儿再试~")
+            return
+        from providers.web_search import format_results
+        block = format_results(results, max_chars=1800)
+        # Hand the results to the chat path so the bot picks them up in
+        # character. Strip URLs from the spoken summary — persona handles that.
+        prompt = (
+            f"用户让我联网搜索 '{query}'。下面是搜到的内容：\n\n{block}\n\n"
+            "请基于上述资料用一两句话回答用户。不要把所有 URL 都念出来；"
+            "如果资料里没有有用信息，就直说没查到。"
+        )
+        await self._run_deepseek_chat(msg, prompt)
+
+    async def _run_teach(self, msg: ParsedMessage, rule: str) -> None:
+        """`/teach <rule>` — explicitly save a behavioral rule / fact /
+        agreement / reminder. Bypasses the keyword pre-filter (since the user
+        is intentionally teaching), but still runs the LLM classifier so the
+        right `kind` and trigger_at get filled in."""
+        rule = (rule or "").strip()
+        if not rule:
+            await self._reply(
+                msg.group_id,
+                "用法: /teach <规则/事实/约定>，比如 /teach 群里有人发666你也跟一个",
+            )
+            return
+        if not CONFIG.lessons_enabled or self.lessons is None:
+            await self._reply(msg.group_id, "功能注入没开~")
+            return
+        try:
+            row_id = await self.lessons.maybe_learn(
+                group_id=msg.group_id, user_id=msg.user_id,
+                text=rule, addressed=True,
+            )
+        except Exception:
+            log.exception("/teach lesson save crashed")
+            await self._reply(msg.group_id, "记不住，过会再说~")
+            return
+        if row_id:
+            await self._human_send(msg.group_id, f"好的，记下了（#{row_id}）")
+        else:
+            await self._human_send(
+                msg.group_id,
+                "这条没存下来（看起来不像一条要长期遵守的规则）",
+            )
+
+    async def _run_start(self, msg: ParsedMessage) -> None:
+        """`/start` — un-pause the bot in this group. Super-user only."""
+        if msg.user_id not in CONFIG.superusers:
+            await self._reply(msg.group_id, "/start 仅限超级用户使用~")
+            return
+        changed = await allowlist.resume(msg.group_id)
+        if changed:
+            await self._human_send(msg.group_id, "好的，我回来啦~")
+            log.info("group %s un-paused by user %s", msg.group_id, msg.user_id)
+        else:
+            await self._human_send(msg.group_id, "我本来就在群里呀")
+
+    async def _run_stop(self, msg: ParsedMessage) -> None:
+        """`/stop` — pause the bot in this group. Super-user only.
+
+        Paused groups keep recording group_memory (so context survives) but
+        the bot won't reply or run any LLM route until a `/start` from a
+        super-user resumes it.
+        """
+        if msg.user_id not in CONFIG.superusers:
+            await self._reply(msg.group_id, "/stop 仅限超级用户使用~")
+            return
+        changed = await allowlist.pause(msg.group_id, msg.user_id)
+        if changed:
+            await self._human_send(
+                msg.group_id,
+                "好，我先安静一会儿，要叫我回来用 /start",
+            )
+            log.info("group %s paused by user %s", msg.group_id, msg.user_id)
+        else:
+            await self._human_send(msg.group_id, "我已经在休息啦")
+
+    async def _run_dream(self, msg: ParsedMessage) -> None:
+        """`/dream` — force the overnight dream routine to run now. Super-user
+        only since it consumes a deepseek call and is mainly a debugging aid."""
+        if msg.user_id not in CONFIG.superusers:
+            await self._reply(msg.group_id, "/dream 仅限超级用户使用~")
+            return
+        if self.long_memory is None:
+            await self._reply(msg.group_id, "长时记忆没开，没法编梦~")
+            return
+        recaps = await self.long_memory.recent(msg.group_id, days=5)
+        if not recaps:
+            await self._human_send(
+                msg.group_id, "本群最近没什么记忆，做不出梦来",
+            )
+            return
+        await self.send_dream(msg.group_id, recaps)
 
     async def _run_file_qa(self, msg: ParsedMessage, prompt: str) -> None:
         """/file <question> — answer based on file content already injected
@@ -1097,7 +1392,15 @@ class Handler:
         messages.append(ChatMessage(role="user", content=prompt))
 
         try:
-            reply = await provider.chat(messages, model=model, max_tokens=600)
+            if CONFIG.tool_use_enabled and not self.tools.is_empty():
+                ctx = ToolContext(group_id=msg.group_id, user_id=msg.user_id)
+                reply = await run_with_tools(
+                    provider=provider, messages=messages, registry=self.tools,
+                    ctx=ctx, model=model, max_tokens=600,
+                    max_hops=CONFIG.tool_use_max_hops,
+                )
+            else:
+                reply = await provider.chat(messages, model=model, max_tokens=600)
         except ProviderError:
             log.exception("text route provider error")
             await self._reply(msg.group_id, ERROR_MSG)
@@ -1320,6 +1623,187 @@ class Handler:
         if a in ("一周", "一週"):
             return (now - timedelta(days=7)).timestamp(), "最近 7 天"
         return None
+
+    # ---------- /timewarp (nostalgic recall) ----------
+    @staticmethod
+    def _parse_timewarp(args: str) -> Optional[Tuple[float, float, str]]:
+        """Parse a past-time expression into (start_ts, end_ts, label).
+
+        Returns None for unrecognised input. Window is a few days around the
+        target date so the LLM has more than one recap to riff on.
+        """
+        a = args.strip().lower()
+        now = datetime.now()
+        # YYYY-MM-DD → ±3 days.
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", a):
+            try:
+                d = datetime.strptime(a, "%Y-%m-%d")
+            except ValueError:
+                return None
+            return (
+                (d - timedelta(days=3)).timestamp(),
+                (d + timedelta(days=4)).timestamp(),
+                a,
+            )
+        # YYYY-MM → whole month.
+        if re.match(r"^\d{4}-\d{2}$", a):
+            try:
+                d = datetime.strptime(a + "-01", "%Y-%m-%d")
+            except ValueError:
+                return None
+            nxt = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+            return d.timestamp(), nxt.timestamp(), a
+        # Shorthand phrases. Default (empty) = a year ago.
+        days: Optional[int] = None
+        label = ""
+        if not a or a in ("一年前", "去年", "1 year ago"):
+            days, label = 365, "一年前"
+        elif "半年" in a:
+            days, label = 180, "半年前"
+        elif "三个月" in a or "3个月" in a:
+            days, label = 90, "三个月前"
+        elif "两个月" in a or "2个月" in a:
+            days, label = 60, "两个月前"
+        elif "一个月" in a or a in ("上月", "上个月", "last month"):
+            days, label = 30, "一个月前"
+        elif "一周" in a or a in ("上周", "上礼拜", "last week"):
+            days, label = 7, "上周"
+        else:
+            m = re.match(r"^(\d+)\s*天前?$", a)
+            if m:
+                days = int(m.group(1))
+                label = f"{days} 天前"
+            else:
+                m = re.match(r"^(\d+)\s*年前?$", a)
+                if m:
+                    days = int(m.group(1)) * 365
+                    label = f"{m.group(1)} 年前"
+                else:
+                    m = re.match(r"^(\d+)\s*个?月前?$", a)
+                    if m:
+                        days = int(m.group(1)) * 30
+                        label = f"{m.group(1)} 个月前"
+        if days is None:
+            return None
+        target = now - timedelta(days=days)
+        # Use a 7-day window centered on the target so we capture more recaps.
+        start = target - timedelta(days=3)
+        end = target + timedelta(days=4)
+        return start.timestamp(), end.timestamp(), label
+
+    async def _run_timewarp(self, msg: ParsedMessage, args: str) -> None:
+        """`/timewarp <时间>` — bot writes a short nostalgic riff based on
+        the daily_recaps stored for that period."""
+        if self.long_memory is None:
+            await self._reply(msg.group_id, "长时记忆没开~")
+            return
+        parsed = self._parse_timewarp(args)
+        if parsed is None:
+            await self._reply(
+                msg.group_id,
+                "用法: /timewarp 一年前 | 半年前 | 三个月前 | 上个月 | 上周 | "
+                "YYYY-MM | YYYY-MM-DD",
+            )
+            return
+        start_ts, end_ts, label = parsed
+        store = await Storage.get()
+        # Pull a wide window of recaps and filter client-side. Recaps are
+        # short (~100 chars each) so even fetching the recent 400 is cheap.
+        all_rows = await store.daily_recap_recent(msg.group_id, 400)
+        in_range: List[Tuple[str, str]] = []
+        for day, summary in all_rows:
+            try:
+                day_ts = datetime.strptime(day, "%Y-%m-%d").timestamp()
+            except ValueError:
+                continue
+            if start_ts <= day_ts < end_ts:
+                in_range.append((day, summary))
+        if not in_range:
+            await self._human_send(
+                msg.group_id, f"{label}那段时间…我好像没什么记忆"
+            )
+            return
+        in_range.sort(key=lambda r: r[0])
+        bullet = "\n".join(f"- {d}: {s}" for d, s in in_range[:14])
+        prompt = (
+            f"你是 {CONFIG.bot_nickname}，正在怀念群里 {label} 的日子。\n"
+            f"那段时间群里聊过这些（按天序）：\n{bullet}\n\n"
+            "请以第一人称写一段 100-150 字的怀旧短文：\n"
+            "- 开头用'我记得那时候…'或类似的口吻\n"
+            "- 提一些具体的话题/场景，但不要点名说谁\n"
+            "- 语气温柔、略带感慨\n"
+            "- 不要 markdown，不要 emoji，不要分点列表，不要署名"
+        )
+        try:
+            reply = await self.deepseek.chat(
+                [
+                    ChatMessage(role="system", content=load_persona()),
+                    ChatMessage(role="user", content=prompt),
+                ],
+                temperature=0.7,
+                max_tokens=400,
+            )
+        except ProviderError:
+            log.exception("timewarp deepseek failed")
+            await self._reply(msg.group_id, ERROR_MSG)
+            return
+        await self._human_send(msg.group_id, reply.text)
+
+    # ---------- bot dreams (overnight ambient post) ----------
+    async def maybe_send_dream(self) -> int:
+        """Pick one allowed group with recent activity and post a dream.
+        Returns 1 if a dream was sent, else 0."""
+        if self.long_memory is None:
+            return 0
+        groups = sorted(await allowlist.all_allowed_groups())
+        if not groups:
+            return 0
+        random.shuffle(groups)
+        for gid in groups:
+            recaps = await self.long_memory.recent(gid, days=5)
+            if recaps:
+                await self.send_dream(gid, recaps)
+                return 1
+        return 0
+
+    async def send_dream(
+        self, group_id: int, recaps: List[Tuple[str, str]],
+    ) -> None:
+        """Generate a 1-2 sentence "I just had a dream..." message rooted
+        in recent group themes, and post it via the normal human-send path
+        so it lands in group_memory."""
+        bullet = "\n".join(f"- {d}: {s}" for d, s in reversed(recaps))
+        now = datetime.now()
+        system = (
+            f"你叫 {CONFIG.bot_nickname}。现在是凌晨 {now.strftime('%H:%M')}，"
+            "你刚做了个梦，想发到 QQ 群里。"
+        )
+        user = (
+            "群里最近几天的话题（按天序，旧 → 新）：\n" + bullet + "\n\n"
+            "请用你自己的口吻写一条群消息描述这个梦。要求：\n"
+            "- 1-2 句话，不超过 60 字\n"
+            "- 梦的内容超现实、有点荒诞，但能隐约看到群里最近聊过的某个东西\n"
+            "- 用'我刚做了个梦…'或'刚梦到…'之类的开头\n"
+            "- 不要解释、不要 emoji、不要 markdown\n"
+            "- 不要点名说谁，用'有人'替代"
+        )
+        try:
+            reply = await self.deepseek.chat(
+                [
+                    ChatMessage(role="system", content=system),
+                    ChatMessage(role="user", content=user),
+                ],
+                temperature=1.0,
+                max_tokens=120,
+            )
+        except ProviderError:
+            log.warning("dream generation call failed")
+            return
+        text = (reply.text or "").strip()
+        if not text:
+            return
+        log.info("dream group=%s text=%r", group_id, text[:120])
+        await self._human_send(group_id, text)
 
     # ---------- /recall (long-term memory query) ----------
     _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")

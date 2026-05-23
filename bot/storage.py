@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS daily_report (
     day TEXT PRIMARY KEY
 );
 
+-- Per-group pause flag. Presence of a row means the bot is silenced in that
+-- group (still records group_memory so context survives a /start, but won't
+-- reply or run LLM routes). Removed by /start. Allow-list state is separate:
+-- a group can be allow-listed AND paused at the same time.
+CREATE TABLE IF NOT EXISTS group_pause (
+    group_id  INTEGER PRIMARY KEY,
+    paused_at TEXT NOT NULL,
+    paused_by INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS group_memory (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id  INTEGER NOT NULL,
@@ -471,6 +481,45 @@ class Storage:
             )
             await self._conn.commit()
             return (cur.rowcount or 0) > 0
+
+    # ---------- per-group pause ----------
+    async def group_pause_is_set(self, group_id: int) -> bool:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT 1 FROM group_pause WHERE group_id=?", (group_id,),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def group_pause_set(self, group_id: int, by_user_id: int) -> bool:
+        """Pause this group. Returns True if a new row was inserted, False if
+        the group was already paused."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT OR IGNORE INTO group_pause(group_id, paused_at, paused_by)"
+                " VALUES(?, datetime('now'), ?)",
+                (group_id, by_user_id),
+            )
+            await self._conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def group_pause_clear(self, group_id: int) -> bool:
+        """Resume this group. Returns True if a row was actually removed."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM group_pause WHERE group_id=?", (group_id,),
+            )
+            await self._conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def group_pause_list(self) -> List[int]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT group_id FROM group_pause ORDER BY group_id",
+        ) as cur:
+            rows = await cur.fetchall()
+        return [int(r[0]) for r in rows]
 
     # ---------- group memory ----------
     async def group_memory_append(

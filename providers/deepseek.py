@@ -8,9 +8,52 @@ import httpx
 
 from bot.logger import get_logger
 from config import CONFIG
-from providers.base import ChatMessage, ProviderError, TextReply
+from providers.base import ChatMessage, ProviderError, TextReply, ToolCall
 
 log = get_logger(__name__)
+
+
+def _message_to_wire(m: ChatMessage) -> Dict[str, Any]:
+    """Serialize a ChatMessage into the OpenAI-compatible wire format,
+    threading through tool_calls and tool result fields when present."""
+    out: Dict[str, Any] = {"role": m.role, "content": m.content or ""}
+    if m.tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.arguments or "{}"},
+            }
+            for tc in m.tool_calls
+        ]
+        # Assistant messages that solely request tool calls usually have empty
+        # content. OpenAI lets us send it as null; "" also works, leave as is.
+    if m.role == "tool":
+        if m.tool_call_id:
+            out["tool_call_id"] = m.tool_call_id
+        if m.name:
+            out["name"] = m.name
+    return out
+
+
+def _parse_tool_calls(raw: Any) -> List[ToolCall]:
+    """Pull tool_calls out of a chat-completion response message."""
+    if not isinstance(raw, list):
+        return []
+    calls: List[ToolCall] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function") or {}
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        calls.append(ToolCall(
+            id=str(entry.get("id") or f"call_{len(calls)}"),
+            name=name,
+            arguments=str(fn.get("arguments") or ""),
+        ))
+    return calls
 
 
 class DeepSeekProvider:
@@ -36,10 +79,11 @@ class DeepSeekProvider:
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> TextReply:
         body: Dict[str, Any] = {
             "model": model or CONFIG.deepseek_chat_model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_message_to_wire(m) for m in messages],
             "temperature": temperature,
             "stream": False,
         }
@@ -47,6 +91,8 @@ class DeepSeekProvider:
             body["max_tokens"] = max_tokens
         if response_format:
             body["response_format"] = response_format
+        if tools:
+            body["tools"] = tools
 
         url = f"{CONFIG.deepseek_base_url.rstrip('/')}/chat/completions"
         try:
@@ -59,17 +105,25 @@ class DeepSeekProvider:
             )
         data = resp.json()
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            choice = data["choices"][0]
+            msg = choice.get("message") or {}
+            text = msg.get("content") or ""
         except (KeyError, IndexError) as e:
             raise ProviderError(f"DeepSeek malformed response: {e}: {data}") from e
+        tool_calls = _parse_tool_calls(msg.get("tool_calls"))
         usage = data.get("usage", {}) or {}
+        finish_reason = str(choice.get("finish_reason") or "")
         log.info(
-            "deepseek call ok model=%s tokens_in=%s tokens_out=%s",
+            "deepseek call ok model=%s tokens_in=%s tokens_out=%s tools=%d finish=%s",
             body["model"],
             usage.get("prompt_tokens"),
             usage.get("completion_tokens"),
+            len(tool_calls), finish_reason,
         )
-        return TextReply(text=text.strip(), usage=usage, model=body["model"])
+        return TextReply(
+            text=text.strip(), usage=usage, model=body["model"],
+            tool_calls=tool_calls, finish_reason=finish_reason,
+        )
 
     async def chat_stream(
         self,

@@ -239,6 +239,46 @@ class Config:
     # Requires ffmpeg on PATH. 0 disables.
     file_video_frame_count: int = _env_int("FILE_VIDEO_FRAME_COUNT", 4)
 
+    # ----- Tool use (LLM-driven function calls) -----
+    # When ON, every text chat call exposes a registry of tools the model can
+    # invoke (currently: web_search). The handler runs up to MAX_HOPS rounds
+    # of tool→result→chat, then the model commits to a final answer. Set to 0
+    # to revert to "no tools, model relies on its training cutoff only".
+    tool_use_enabled: bool = (
+        os.getenv("TOOL_USE_ENABLED", "1") not in ("0", "false", "False")
+    )
+    # How many rounds of tool-call → tool-result → chat are allowed in one
+    # user turn before we force the model to give a final answer. 3 is
+    # plenty for most queries; bumps each user turn's worst-case latency.
+    tool_use_max_hops: int = _env_int("TOOL_USE_MAX_HOPS", 3)
+
+    # ----- Web search (one of the tools above) -----
+    # Set WEB_SEARCH_ENABLED=1 and provide TAVILY_API_KEY to expose a
+    # `web_search` tool the LLM can call when a question needs current /
+    # niche / named-entity grounding. Falls back gracefully if the key is
+    # missing — the tool registers but returns an "unavailable" message.
+    web_search_enabled: bool = (
+        os.getenv("WEB_SEARCH_ENABLED", "1") not in ("0", "false", "False")
+    )
+    web_search_provider: str = os.getenv("WEB_SEARCH_PROVIDER", "tavily").lower()
+    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
+    # Cap on results we request per search. More = more grounding but more
+    # tokens in the next chat call.
+    web_search_max_results: int = _env_int("WEB_SEARCH_MAX_RESULTS", 5)
+
+    # ----- Bot dreams (氛围向：凌晨偶尔发一段"我刚做了个梦…") -----
+    # When ON, a background task fires between [start, end) hours local time
+    # with `dream_probability` chance per tick. The dream draws inspiration
+    # from recent daily recaps so it stays vaguely connected to group themes.
+    # Disable to keep the bot silent overnight.
+    dream_enabled: bool = (
+        os.getenv("DREAM_ENABLED", "1") not in ("0", "false", "False")
+    )
+    dream_hour_start: int = _env_int("DREAM_HOUR_START", 3)
+    dream_hour_end: int = _env_int("DREAM_HOUR_END", 5)
+    dream_probability: float = float(os.getenv("DREAM_PROBABILITY", "0.30"))
+    dream_check_interval_seconds: int = _env_int("DREAM_CHECK_INTERVAL_SECONDS", 1800)
+
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     limits: Limits = field(default_factory=Limits)
 

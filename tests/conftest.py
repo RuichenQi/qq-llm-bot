@@ -34,6 +34,17 @@ def isolated_storage(tmp_path, monkeypatch):
     # tests that don't opt in shouldn't see that behaviour leak into their
     # stub provider's call log.
     monkeypatch.setattr(cfg.CONFIG, "important_memory_enabled", False, raising=False)
+    # Lessons classifier likewise — addresses → extra LLM call.
+    monkeypatch.setattr(cfg.CONFIG, "lessons_enabled", False, raising=False)
+    # Ambient gate uses random.random(); pin to deterministic always-pass for
+    # tests that exercise non-addressed messages. Tests that want to verify
+    # gating override this explicitly.
+    monkeypatch.setattr(cfg.CONFIG, "ambient_reply_probability_high", 1.0, raising=False)
+    monkeypatch.setattr(cfg.CONFIG, "ambient_reply_probability_low", 1.0, raising=False)
+    monkeypatch.setattr(cfg.CONFIG, "ambient_reply_min_seconds", 0, raising=False)
+    # Quoted-image intent gate runs a vision call — switch it off for unit tests
+    # that aren't exercising it. Tests that care can flip back on.
+    monkeypatch.setattr(cfg.CONFIG, "quoted_image_intent_gate", False, raising=False)
 
     Storage._instance = None  # type: ignore[attr-defined]
     Storage._init_lock = None  # type: ignore[attr-defined]
