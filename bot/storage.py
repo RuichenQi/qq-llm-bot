@@ -89,37 +89,15 @@ CREATE TABLE IF NOT EXISTS daily_recaps (
 CREATE INDEX IF NOT EXISTS daily_recaps_by_group_day
     ON daily_recaps(group_id, day);
 
--- Important-memory layer: free-form things the classifier decided are worth
--- keeping. Two consumption paths share this table:
---   (1) reminder firing loop: rows with trigger_at <= now and status='pending'
---   (2) context injection on chat: rows where subject_user_id IN (NULL, uid)
-CREATE TABLE IF NOT EXISTS memories (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id        INTEGER NOT NULL,
-    subject_user_id INTEGER,                       -- NULL = group-wide
-    content         TEXT NOT NULL,                 -- free-form, LLM-authored
-    importance      REAL NOT NULL DEFAULT 0.5,     -- 0..1, LLM self-rated
-    tags            TEXT NOT NULL DEFAULT '',      -- space-joined keywords
-    trigger_at      REAL,                          -- unix ts; NULL = passive
-    recurrence      TEXT,                          -- NULL | 'daily HH:MM'
-    expires_at      REAL,
-    created_at      REAL NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|fired|cancelled
-    fired_at        REAL,
-    source_text     TEXT NOT NULL DEFAULT '',
-    source_nickname TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS memories_due
-    ON memories(status, trigger_at);
-CREATE INDEX IF NOT EXISTS memories_group_subject
-    ON memories(group_id, subject_user_id, expires_at);
+-- (The pre-unify `memories` table is no longer created here. The migration
+-- in `_migrate_memories_into_lessons` reads from it if present on legacy
+-- DBs, then `_init` drops the empty husk so it stops appearing in tooling.)
 
--- Lessons: unified durable knowledge the group has shared with the bot.
--- Subsumes what used to live in the separate `memories` table — behavior
--- rules, personal facts, group agreements, and scheduled reminders all
--- live here so context-injection + reminder-firing read from one place.
+-- Lessons: unified durable knowledge the group has shared with the bot —
+-- behavior rules, personal facts, group agreements, and scheduled reminders.
+-- Reminder-firing + context-injection both read from this one table.
 --
--- kind ∈ {rule, fact, agreement, reminder, other}.
+-- kind ∈ {rule, fact, agreement, reminder}.
 --   rule       behavioral instruction the bot should follow
 --   fact       persistent attribute of a person or the group
 --   agreement  decision / plan the group reached
@@ -837,11 +815,11 @@ class Storage:
                 )
             await self._conn.commit()
 
-    # Cancel = HARD DELETE. The old design used `status='revoked'` so that
-    # `/admin lessons` could show the audit trail, but in practice this read
-    # as "the bot still kinda remembers what I told it to forget". Cancelled
-    # rows are now physically gone — no surface, no residue, no risk that a
-    # downstream query forgot to filter the status column.
+    # Cancel = HARD DELETE. The old design used `status='revoked'` so admin
+    # views could show an audit trail, but in practice it read as "the bot
+    # still kinda remembers what I told it to forget". Cancelled rows are
+    # now physically gone — no surface, no residue, no risk that a downstream
+    # query forgot to filter the status column.
 
     async def lesson_delete(self, lesson_id: int, group_id: int) -> bool:
         """Hard-delete one row. Returns True if a row was actually removed."""

@@ -1,4 +1,5 @@
-"""Streaming text + /admin commands + reply segments + image disk cache."""
+"""Text chat round-trip + /admin commands + reply segments + image disk cache.
+(Streaming was removed; this module's name is historical.)"""
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +40,7 @@ def _event(text: str, *, user_id: int = 42, reply_id: str | None = None,
     }
 
 
-def _make_handler(monkeypatch, *, stream_chunks=None, fetch_reply=None) -> Tuple[Handler, List[Tuple[int, str]]]:
+def _make_handler(monkeypatch, *, fetch_reply=None) -> Tuple[Handler, List[Tuple[int, str]]]:
     sent: List[Tuple[int, str]] = []
 
     async def send_text(gid: int, text: str) -> None:
@@ -55,12 +56,6 @@ def _make_handler(monkeypatch, *, stream_chunks=None, fetch_reply=None) -> Tuple
         return TextReply(text="non-streamed-ok", model="stub")
 
     stub_provider.chat = stub_chat
-
-    async def stub_chat_stream(messages, **kw):
-        for c in (stream_chunks or ["hel", "lo ", "world"]):
-            yield c
-
-    stub_provider.chat_stream = stub_chat_stream
 
     async def stub_aclose():
         return None

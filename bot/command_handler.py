@@ -751,13 +751,13 @@ class Handler:
     # ---------- route runners ----------
     async def _run_deepseek_chat(self, msg: ParsedMessage, prompt: str) -> None:
         await self._run_text(
-            msg, prompt, provider=self.deepseek, route="deepseek_chat", supports_stream=True,
+            msg, prompt, provider=self.deepseek, route="deepseek_chat",
         )
 
     async def _run_deepseek_think(self, msg: ParsedMessage, prompt: str) -> None:
         await self._run_text(
             msg, prompt, provider=self.deepseek, route="deepseek_think",
-            model=CONFIG.deepseek_reasoner_model, supports_stream=True,
+            model=CONFIG.deepseek_reasoner_model,
         )
 
     async def _run_openai_text(self, msg: ParsedMessage, prompt: str) -> None:
@@ -767,7 +767,7 @@ class Handler:
         if not await self._check_quota("openai_text", msg):
             return
         await self._run_text(
-            msg, prompt, provider=self.openai, route="openai_text", supports_stream=False,
+            msg, prompt, provider=self.openai, route="openai_text",
         )
         await self.quota.consume("openai_text", msg.group_id, msg.user_id)
 
@@ -992,7 +992,7 @@ class Handler:
         )
 
     async def _run_reset(self, msg: ParsedMessage, args: str) -> None:
-        """`/reset confirm` — nuke EVERYTHING for this group. Super-user only.
+        """`/admin reset confirm` — nuke EVERYTHING for this group. Super-user only.
 
         Wipes (per-group, in one shot):
           - every user's conversation memory (`memory` table)
@@ -1522,7 +1522,6 @@ class Handler:
         provider,
         route: str,
         model: Optional[str] = None,
-        supports_stream: bool = False,
     ) -> None:
         if not prompt.strip():
             await self._reply(msg.group_id, "请把你的问题说清楚一点~")
@@ -1602,52 +1601,6 @@ class Handler:
 
         await self.memory.append(msg.group_id, msg.user_id, "user", prompt)
         await self.memory.append(msg.group_id, msg.user_id, "assistant", text)
-
-    async def _stream_text(
-        self,
-        group_id: int,
-        provider,
-        messages: List[ChatMessage],
-        model: Optional[str],
-    ) -> str:
-        """Consume the streaming iterator; flush a QQ message every paragraph or
-        every CONFIG.stream_flush_chars characters."""
-        buf: list[str] = []
-        pending = ""
-        full = ""
-        flush_at = CONFIG.stream_flush_chars
-
-        def _clean(piece: str) -> str:
-            piece = filter_emoji(piece, CONFIG.emoji_keep_probability)
-            piece = filter_interjections(piece)
-            return piece.strip()
-
-        async for chunk in provider.chat_stream(messages, model=model, max_tokens=1200):
-            pending += chunk
-            full += chunk
-            # flush at paragraph breaks, else when buffer crosses threshold
-            while True:
-                nl = pending.find("\n\n")
-                if nl >= 0 and nl + 2 <= len(pending):
-                    piece, pending = pending[: nl + 2], pending[nl + 2 :]
-                    buf.append(piece)
-                    cleaned = _clean(piece)
-                    if cleaned:
-                        await self._reply(group_id, cleaned)
-                    continue
-                if len(pending) >= flush_at:
-                    piece, pending = pending[:flush_at], pending[flush_at:]
-                    buf.append(piece)
-                    cleaned = _clean(piece)
-                    if cleaned:
-                        await self._reply(group_id, cleaned)
-                    continue
-                break
-        if pending.strip():
-            cleaned = _clean(pending)
-            if cleaned:
-                await self._reply(group_id, cleaned)
-        return full.strip() or "(空回复)"
 
     async def _check_quota(self, route: str, msg: ParsedMessage) -> bool:
         ok, reason = await self.quota.check(route, msg.group_id, msg.user_id)
@@ -2167,9 +2120,8 @@ class Handler:
     async def _do_bulk_cancel(
         self, msg: ParsedMessage, rest: str, *, usage_hint: str,
     ) -> None:
-        """Shared implementation of `/remember cancel ...`, `/forget ...`, and
-        `/admin forget_lesson ...`. Hard-deletes the targets and reports the
-        count back to the group."""
+        """Shared implementation of `/remember cancel ...` and `/forget ...`.
+        Hard-deletes the targets and reports the count back to the group."""
         if self.lessons is None:
             await self._reply(msg.group_id, "功能注入未启用~")
             return

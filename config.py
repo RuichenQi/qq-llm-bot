@@ -114,10 +114,6 @@ class Config:
     # call. 0 disables long-memory injection (but recaps are still saved).
     long_memory_inject_days: int = _env_int("LONG_MEMORY_INJECT_DAYS", 5)
 
-    # Streaming. When true, DeepSeek replies are streamed in chunks into QQ.
-    stream_replies: bool = (os.getenv("STREAM_REPLIES", "1") not in ("0", "false", "False"))
-    stream_flush_chars: int = _env_int("STREAM_FLUSH_CHARS", 220)
-
     allowed_groups: Set[int] = field(default_factory=lambda: _csv_ints(os.getenv("ALLOWED_GROUPS")))
     superusers: Set[int] = field(default_factory=lambda: _csv_ints(os.getenv("SUPERUSERS")))
 

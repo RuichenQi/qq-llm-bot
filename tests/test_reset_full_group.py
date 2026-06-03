@@ -1,4 +1,4 @@
-"""`/reset confirm` — full per-group state wipe + `/clear` per-user shortcut."""
+"""`/admin reset confirm` — full per-group state wipe + `/clear` per-user shortcut."""
 from __future__ import annotations
 
 import asyncio

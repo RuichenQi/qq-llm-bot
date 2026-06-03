@@ -395,7 +395,7 @@ class Lessons:
     async def list_all(
         self, group_id: int, limit: int = 50,
     ) -> List[Tuple[int, str, str, float, str, Optional[float], Optional[str]]]:
-        """All rows for /admin lessons."""
+        """All active rows in this group — for admin / debug inspection."""
         store = await Storage.get()
         return await store.lesson_list(group_id, limit)
 

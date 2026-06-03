@@ -1,4 +1,4 @@
-"""Force-trigger commands: /search, /teach, /forget, /dream.
+"""Force-trigger commands: /search, /teach, /forget, /news.
 
 These verify the user-facing commands exist, route to the right handler,
 and respect the sensitive-content gate. The underlying providers (web

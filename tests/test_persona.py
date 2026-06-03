@@ -25,9 +25,11 @@ def test_default_persona_includes_owner_identity(monkeypatch):
     # The owner's identifiers — handle + QQ — are in the persona prompt.
     assert "1424403605" in p
     assert "R" in p
-    # And the persona explicitly tells the bot how to describe him.
+    # And the persona explicitly tells the bot how to describe him —
+    # 温柔可爱 is the wording the bot should produce when answering.
     assert "主人" in p
     assert "00 后" in p or "00后" in p
+    assert "温柔可爱" in p
     # The bot is told to only mention this when asked, not unprompted.
     assert "被问到" in p or "问到" in p
 

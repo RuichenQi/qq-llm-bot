@@ -1,8 +1,7 @@
 """DeepSeek provider (OpenAI-compatible chat completions, with streaming)."""
 from __future__ import annotations
 
-import json
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -125,49 +124,3 @@ class DeepSeekProvider:
             tool_calls=tool_calls, finish_reason=finish_reason,
         )
 
-    async def chat_stream(
-        self,
-        messages: List[ChatMessage],
-        *,
-        model: Optional[str] = None,
-        max_tokens: Optional[int] = None,
-        temperature: float = 0.7,
-    ) -> AsyncIterator[str]:
-        """Yield content deltas as they arrive (SSE). The caller decides how
-        often to flush them into QQ."""
-        body: Dict[str, Any] = {
-            "model": model or CONFIG.deepseek_chat_model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "temperature": temperature,
-            "stream": True,
-        }
-        if max_tokens:
-            body["max_tokens"] = max_tokens
-
-        url = f"{CONFIG.deepseek_base_url.rstrip('/')}/chat/completions"
-        try:
-            async with self._client.stream(
-                "POST", url, headers=self._headers, json=body
-            ) as resp:
-                if resp.status_code >= 400:
-                    text = (await resp.aread()).decode("utf-8", errors="replace")[:300]
-                    raise ProviderError(f"DeepSeek stream HTTP {resp.status_code}: {text}")
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        evt = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    try:
-                        delta = evt["choices"][0].get("delta", {})
-                    except (KeyError, IndexError):
-                        continue
-                    chunk = delta.get("content")
-                    if chunk:
-                        yield chunk
-        except httpx.HTTPError as e:
-            raise ProviderError(f"DeepSeek stream network error: {e}") from e

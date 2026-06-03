@@ -78,7 +78,17 @@ tmux new -s bot
 | `/image <prompt>` | OpenAI image generation — strict quota |
 | `/vision <q>` | Analyse the most recent image with OpenAI vision |
 | `/edit <instruction>` | Edit the most recent image with OpenAI |
-| `/reset` | Clear *your* memory in this group |
+| `/file [q]` | Ask about an attached / quoted file (txt/pdf/docx/code/audio/video) |
+| `/search <q>` | Force a web search + summary (Tavily) |
+| `/news [topic]` | Pull current headlines into a short paragraph (Tavily) |
+| `/teach <rule>` | Pin a verbatim rule into this group's system prompt |
+| `/remember` | List what the bot has saved for this group |
+| `/forget <ids|all|rules\|...>` | Drop one / many / kind / all lessons |
+| `/recap [period]` | Summarise recent group activity |
+| `/recall [date\|kw]` | Query long-term daily recaps |
+| `/timewarp [period]` | Bot writes a short nostalgic riff about that time |
+| `/start` / `/stop` | Bring the bot back / silence it in this group (super-user) |
+| `/clear` | Clear *your* memory in this group |
 | `/balance` | Show today's usage vs. limits |
 | `/help` | List commands |
 
@@ -164,13 +174,14 @@ Add your QQ id to `SUPERUSERS=...` in `.env` and use `/admin`:
 | `/admin status` | This group's per-route usage today |
 | `/admin usage` | Today's usage across every group |
 | `/admin reset_quota` | Clear today's quota across all groups/users |
-| `/admin reset_memory <uid>` | Drop one user's memory in this group |
-| `/admin reset_memory all` | Drop every memory in this group |
+| `/admin clear <uid\|@user>` | Drop one user's conversation memory in this group |
+| `/admin reset confirm` | Wipe everything in this group (memory + group log + recaps + lessons); preserves allow-list and pause state |
 | `/admin allow_group <gid>` | Add a group to the runtime allow-list |
 | `/admin disallow_group <gid>` | Remove a group (env-pinned groups can't be removed) |
-| `/admin list_groups` | Show every allowed group (`*` = pinned in `.env`) |
+| `/admin list_groups` | Show every allowed group (`*` = pinned in `.env`, `⏸` = `/stop`-paused) |
 | `/admin report` | Push today's daily-report right now |
 | `/admin ping` | OneBot WS health: connected? last event? last heartbeat? reconnects? |
+| `/admin save_recap [day]` | Force-write a daily recap for today / yesterday / `YYYY-MM-DD` |
 
 ## Streaming + daily report + reply quotes
 
