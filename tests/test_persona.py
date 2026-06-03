@@ -16,6 +16,22 @@ def test_default_persona_substitutes_nickname(monkeypatch):
     assert "温柔" in p  # default persona content
 
 
+def test_default_persona_includes_owner_identity(monkeypatch):
+    """The persona must teach the bot who R is, so group members asking
+    "你主人是谁" get a correct answer."""
+    monkeypatch.setattr(cfg.CONFIG, "bot_nickname", "小笨蛋", raising=False)
+    monkeypatch.setattr(cfg.CONFIG, "bot_persona_file", "", raising=False)
+    p = load_persona()
+    # The owner's identifiers — handle + QQ — are in the persona prompt.
+    assert "1424403605" in p
+    assert "R" in p
+    # And the persona explicitly tells the bot how to describe him.
+    assert "主人" in p
+    assert "00 后" in p or "00后" in p
+    # The bot is told to only mention this when asked, not unprompted.
+    assert "被问到" in p or "问到" in p
+
+
 def test_persona_from_file(monkeypatch, tmp_path):
     persona_path = tmp_path / "p.txt"
     persona_path.write_text("你是 {nickname}，今天是英语角的小老师。", encoding="utf-8")

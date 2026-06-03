@@ -110,6 +110,11 @@ class LongMemory:
         store = await Storage.get()
         return await store.daily_recap_prune(CONFIG.daily_recap_keep_days)
 
+    async def reset_group(self, group_id: int) -> int:
+        """Wipe every daily recap for one group. Returns rows deleted."""
+        store = await Storage.get()
+        return await store.daily_recap_reset(group_id)
+
     @staticmethod
     def _format_transcript(rows: List[GroupMsg]) -> str:
         lines = []

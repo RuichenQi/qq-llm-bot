@@ -160,17 +160,10 @@ class Config:
         os.getenv("AUTO_VISION_GROUP_IMAGES", "0") not in ("0", "false", "False")
     )
 
-    # ----- Important-memory layer (LLM-judged facts / reminders / decisions) -----
-    important_memory_enabled: bool = (
-        os.getenv("IMPORTANT_MEMORY_ENABLED", "1") not in ("0", "false", "False")
-    )
-    # Top-N memories injected into each chat turn's system prompt. 0 disables
-    # context-injection (reminders still fire).
-    important_memory_recall_limit: int = _env_int("IMPORTANT_MEMORY_RECALL_LIMIT", 6)
     # Reminder loop tick (seconds). 30 = up-to-30s late on a "9:00pm" reminder.
     reminder_tick_seconds: int = _env_int("REMINDER_TICK_SECONDS", 30)
     # Combined maintenance loop tick (seconds). Runs daily-recap refresh +
-    # memories dedup + expiry on every tick.
+    # lessons dedup + expiry on every tick.
     maintenance_tick_seconds: int = _env_int("MAINTENANCE_TICK_SECONDS", 1800)
 
     # ----- Proactive interjection -----
@@ -181,7 +174,7 @@ class Config:
     )
     # Probability (0..1) each non-addressed message is even considered.
     # The actual decision is then made by an LLM judge that mostly says skip.
-    proactive_probability: float = float(os.getenv("PROACTIVE_PROBABILITY", "0.08"))
+    proactive_probability: float = float(os.getenv("PROACTIVE_PROBABILITY", "0.04"))
     # Minimum seconds since the bot last spoke in this group before another
     # proactive interjection is allowed.
     proactive_min_seconds: int = _env_int("PROACTIVE_MIN_SECONDS", 90)
@@ -195,11 +188,20 @@ class Config:
     # message into two tiers:
     #   high = real question / call for opinion / clear conversational hook
     #   low  = banter / reactions / off-topic / private convo between others
-    # 1.0 disables a gate. Directly-addressed messages bypass both gates.
-    ambient_reply_probability_high: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_HIGH", "0.2"))
-    ambient_reply_probability_low: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_LOW", "0.001"))
-    # Per-group minimum seconds between unaddressed replies. Applies to both tiers.
-    ambient_reply_min_seconds: int = _env_int("AMBIENT_REPLY_MIN_SECONDS", 60)
+    # On top of that, if the message LOOKS LIKE A QUESTION (contains ?/？ or
+    # ends with a Chinese question particle 吗/呢/么/嘛 or starts with a WH-word
+    # like 为啥/怎么/哪…), we use `question` instead of `high` — because most of
+    # those questions are aimed at a specific other person, not at the bot, so
+    # the bot butting in feels intrusive.
+    # 1.0 disables a gate. Directly-addressed messages bypass these gates.
+    # Defaults are deliberately low — the bot should feel like a quiet
+    # groupmate who occasionally chimes in, not someone who answers every
+    # other message.
+    ambient_reply_probability_high: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_HIGH", "0.01"))
+    ambient_reply_probability_question: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_QUESTION", "0.005"))
+    ambient_reply_probability_low: float = float(os.getenv("AMBIENT_REPLY_PROBABILITY_LOW", "0.0001"))
+    # Per-group minimum seconds between unaddressed replies. Applies to all tiers.
+    ambient_reply_min_seconds: int = _env_int("AMBIENT_REPLY_MIN_SECONDS", 120)
 
     # ----- Lessons (group-taught behavior rules) -----
     # When ON, every addressed message (@bot or nickname-in-text) is also fed
@@ -266,18 +268,33 @@ class Config:
     # tokens in the next chat call.
     web_search_max_results: int = _env_int("WEB_SEARCH_MAX_RESULTS", 5)
 
-    # ----- Bot dreams (氛围向：凌晨偶尔发一段"我刚做了个梦…") -----
-    # When ON, a background task fires between [start, end) hours local time
-    # with `dream_probability` chance per tick. The dream draws inspiration
-    # from recent daily recaps so it stays vaguely connected to group themes.
-    # Disable to keep the bot silent overnight.
-    dream_enabled: bool = (
-        os.getenv("DREAM_ENABLED", "1") not in ("0", "false", "False")
+    # ----- News drop (replaces the old "dreams" feature) -----
+    # Once a day at NEWS_TIME (in NEWS_TIME_TZ), the bot pulls a broad
+    # "what's hot today" search, lets the LLM pick the few items it finds
+    # actually interesting (filter rules baked into the prompt — skip CN
+    # politics, skip celebrity gossip, skip heavy/disaster news), and posts
+    # the result as a short paragraph to every allowed, non-paused group
+    # that hasn't received news in NEWS_MIN_INTERVAL_HOURS.
+    # Costs ≈ 1 Tavily + 1 DeepSeek per group per day.
+    # Any user can force a post via `/news [topic]`.
+    news_enabled: bool = (
+        os.getenv("NEWS_ENABLED", "0") not in ("0", "false", "False")
     )
-    dream_hour_start: int = _env_int("DREAM_HOUR_START", 3)
-    dream_hour_end: int = _env_int("DREAM_HOUR_END", 5)
-    dream_probability: float = float(os.getenv("DREAM_PROBABILITY", "0.30"))
-    dream_check_interval_seconds: int = _env_int("DREAM_CHECK_INTERVAL_SECONDS", 1800)
+    # HH:MM in NEWS_TIME_TZ. Defaults to 09:00 Beijing — breakfast news.
+    news_time: str = os.getenv("NEWS_TIME", "09:00")
+    # IANA timezone string for NEWS_TIME. Default Asia/Shanghai (UTC+08:00).
+    news_time_tz: str = os.getenv("NEWS_TIME_TZ", "Asia/Shanghai")
+    # Per-group minimum gap between news posts (hours). Prevents a runaway
+    # config tweak or restart from double-posting on the same day.
+    news_min_interval_hours: int = _env_int("NEWS_MIN_INTERVAL_HOURS", 20)
+    # Broad search query handed to Tavily. The LLM then filters the results
+    # against its persona-aligned interestingness rules (in the prompt). The
+    # default is intentionally vague — we want to see a wide cross-section
+    # and let the LLM pick. Users can override per-call with /news <topic>.
+    news_query: str = os.getenv("NEWS_QUERY", "今日热点新闻")
+    # How many search results to feed the LLM per post. 5-8 gives the LLM
+    # room to discard noise; more than that just inflates the prompt.
+    news_search_max_results: int = _env_int("NEWS_SEARCH_MAX_RESULTS", 7)
 
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     limits: Limits = field(default_factory=Limits)

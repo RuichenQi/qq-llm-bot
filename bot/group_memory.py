@@ -62,3 +62,8 @@ class GroupMemory:
         store = await Storage.get()
         rows = await store.group_memory_since(group_id, since_ts)
         return [GroupMsg(ts=r[0], user_id=r[1], nickname=r[2], text=r[3]) for r in rows]
+
+    async def reset_group(self, group_id: int) -> int:
+        """Wipe the rolling chat log for one group. Returns rows deleted."""
+        store = await Storage.get()
+        return await store.group_memory_reset(group_id)

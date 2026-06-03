@@ -92,8 +92,10 @@ def test_help_lists_new_commands(monkeypatch):
     body = sent[0][1]
     for cmd in ("/ask", "/search", "/teach", "/forget", "/file", "/vision",
                 "/image", "/edit", "/recap", "/recall", "/timewarp",
-                "/remember", "/balance", "/reset"):
+                "/remember", "/balance", "/clear"):
         assert cmd in body, f"{cmd} missing from /help"
+    # /reset is no longer a top-level command — it lives under /admin reset.
+    assert "/admin reset" in body
 
 
 # ---------- /search ----------
@@ -157,16 +159,20 @@ def test_teach_without_text_explains_usage(monkeypatch):
     assert sent and "用法" in sent[0][1]
 
 
-def test_teach_persists_rule(monkeypatch):
+def test_teach_persists_literal_text(monkeypatch):
+    """`/teach` goes through teach_raw (no classifier), so the exact wording
+    is what gets persisted and later injected into this group's chats."""
     received: List[dict] = []
 
     class FakeLessons:
-        async def maybe_learn(self, *, group_id, user_id, text, addressed=False):
+        async def teach_raw(self, *, group_id, user_id, text):
             received.append({
-                "group_id": group_id, "user_id": user_id,
-                "text": text, "addressed": addressed,
+                "group_id": group_id, "user_id": user_id, "text": text,
             })
             return 42
+
+        async def maybe_learn(self, *, group_id, user_id, text, addressed=False):
+            raise AssertionError("/teach must bypass the LLM classifier")
 
     monkeypatch.setattr(cfg.CONFIG, "lessons_enabled", True, raising=False)
     handler, sent = _make_handler(monkeypatch, lessons=FakeLessons())
@@ -174,9 +180,25 @@ def test_teach_persists_rule(monkeypatch):
         "/teach 群里有人发666你也跟一个"
     ))))
     asyncio.run(handler.aclose())
-    assert received and received[0]["text"] == "群里有人发666你也跟一个"
-    assert received[0]["addressed"] is True
+    assert received == [{
+        "group_id": 1, "user_id": 42,
+        "text": "群里有人发666你也跟一个",
+    }]
     assert sent and "#42" in sent[0][1]
+    assert "本群" in sent[0][1], "ack should clarify scope is this group"
+
+
+def test_teach_rejects_oversized_input(monkeypatch):
+    """teach_raw refuses > 500 char text; /teach reports the limit."""
+    class FakeLessons:
+        async def teach_raw(self, *, group_id, user_id, text):
+            return 0  # the real implementation refuses; mirror that here
+
+    monkeypatch.setattr(cfg.CONFIG, "lessons_enabled", True, raising=False)
+    handler, sent = _make_handler(monkeypatch, lessons=FakeLessons())
+    asyncio.run(handler.handle(parse_event(_event("/teach " + "啊" * 600))))
+    asyncio.run(handler.aclose())
+    assert sent and "太长" in sent[0][1]
 
 
 def test_teach_disabled_says_so(monkeypatch):
@@ -189,29 +211,40 @@ def test_teach_disabled_says_so(monkeypatch):
 
 # ---------- /forget ----------
 def test_forget_aliases_remember_cancel(monkeypatch):
-    cancelled: List[int] = []
+    cancelled: List[List[int]] = []
 
     class FakeLessons:
         async def list_pending(self, *a, **k):
             return []
 
         async def cancel(self, lesson_id, group_id):
-            cancelled.append(lesson_id)
+            cancelled.append([lesson_id])
             return True
+
+        async def cancel_many(self, ids, group_id):
+            cancelled.append(list(ids))
+            return len(ids)
+
+        async def cancel_all(self, group_id, kind=None):
+            cancelled.append(["all" if kind is None else kind])
+            return 0
 
     monkeypatch.setattr(cfg.CONFIG, "lessons_enabled", True, raising=False)
     handler, sent = _make_handler(monkeypatch, lessons=FakeLessons())
     asyncio.run(handler.handle(parse_event(_event("/forget 7"))))
     asyncio.run(handler.aclose())
-    assert cancelled == [7]
+    # `/forget 7` parses as a single-id list and routes to cancel_many.
+    assert cancelled == [[7]]
 
 
-# ---------- /dream ----------
-def test_dream_superuser_only(monkeypatch):
-    """Non-superusers get refused."""
-    handler, sent = _make_handler(monkeypatch)
-    # The event uses user_id=42, which IS a superuser in _make_handler. Use a
-    # different id here.
-    asyncio.run(handler.handle(parse_event(_event("/dream", user_id=9999))))
+# ---------- /news ----------
+def test_news_without_backend_says_not_configured(monkeypatch):
+    """Without a Tavily key /news politely degrades — but it's still
+    available to anyone (no superuser gate any more)."""
+    handler, sent = _make_handler(monkeypatch, web_search=None)
+    asyncio.run(handler.handle(parse_event(_event("/news", user_id=9999))))
     asyncio.run(handler.aclose())
-    assert sent and "超级用户" in sent[0][1]
+    assert sent and ("TAVILY" in sent[0][1] or "联网" in sent[0][1])
+    # Crucially, the message is NOT "仅限超级用户" — non-superusers reach
+    # the same code path as everyone else.
+    assert "超级用户" not in sent[0][1]

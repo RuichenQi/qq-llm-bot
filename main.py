@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import signal
 import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bot import allowlist
 from bot.command_handler import Handler
@@ -124,32 +124,59 @@ async def _maintenance_loop(handler: Handler) -> None:
             await asyncio.sleep(60)
 
 
-async def _dream_loop(handler: Handler) -> None:
-    """Overnight ambient: fire `handler.maybe_send_dream()` with low
-    probability during the configured local-time window. Cheap (one
-    deepseek_chat per dream) and bounded by the per-tick coin flip."""
-    if not CONFIG.dream_enabled:
+def _seconds_until_news_time() -> float:
+    """Seconds from now until the next NEWS_TIME in NEWS_TIME_TZ. If the
+    target hour:minute has already passed today, returns the gap to the
+    same time tomorrow. Falls back to UTC if the configured timezone name
+    can't be loaded (rare on Windows without tzdata)."""
+    try:
+        hh, mm = (int(x) for x in CONFIG.news_time.split(":", 1))
+    except Exception:
+        hh, mm = 9, 0
+    try:
+        tz = ZoneInfo(CONFIG.news_time_tz)
+    except ZoneInfoNotFoundError:
+        log.warning(
+            "news: timezone %r not available, falling back to UTC",
+            CONFIG.news_time_tz,
+        )
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz)
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _news_loop(handler: Handler) -> None:
+    """Daily news drop. Sleeps until next NEWS_TIME (default 09:00 Asia/
+    Shanghai), fires `handler.send_news_to_all_groups()`, repeats.
+
+    Per-group min-interval guards against double-posting from a quick restart.
+    Per-group `/stop` pause skips silenced groups. The actual content selection
+    happens inside the handler — we just trigger the daily fire here.
+    """
+    if not CONFIG.news_enabled:
         return
-    period = max(300, CONFIG.dream_check_interval_seconds)
     log.info(
-        "dream loop tick every %ds (hours [%d,%d), p=%.2f)",
-        period, CONFIG.dream_hour_start, CONFIG.dream_hour_end,
-        CONFIG.dream_probability,
+        "news loop: daily at %s %s",
+        CONFIG.news_time, CONFIG.news_time_tz,
     )
     while True:
         try:
-            await asyncio.sleep(period)
-            hour = datetime.now().hour
-            if not (CONFIG.dream_hour_start <= hour < CONFIG.dream_hour_end):
-                continue
-            if random.random() >= CONFIG.dream_probability:
-                continue
-            await handler.maybe_send_dream()
+            wait_s = _seconds_until_news_time()
+            log.info("news loop: next post in %.0fs (%.1fh)",
+                     wait_s, wait_s / 3600.0)
+            await asyncio.sleep(wait_s)
+            fired = await handler.send_news_to_all_groups()
+            log.info("news loop: fired in %d group(s)", fired)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("dream loop iteration failed")
-            await asyncio.sleep(60)
+            log.exception("news loop iteration failed")
+            # Don't burn CPU if the loop body keeps throwing — back off a
+            # few minutes before retrying the schedule calculation.
+            await asyncio.sleep(300)
 
 
 async def _reminder_loop(handler: Handler) -> None:
@@ -266,7 +293,7 @@ async def amain() -> int:
     sweeper_task = asyncio.create_task(_image_sweeper(), name="image_sweeper")
     maint_task = asyncio.create_task(_maintenance_loop(handler), name="maintenance")
     reminder_task = asyncio.create_task(_reminder_loop(handler), name="reminders")
-    dream_task = asyncio.create_task(_dream_loop(handler), name="dreams")
+    news_task = asyncio.create_task(_news_loop(handler), name="news")
     stop_task = asyncio.create_task(stop_event.wait(), name="stop_wait")
 
     try:
@@ -276,7 +303,7 @@ async def amain() -> int:
     finally:
         await client.stop()
         for t in (run_task, stop_task, report_task, sweeper_task,
-                  maint_task, reminder_task, dream_task):
+                  maint_task, reminder_task, news_task):
             if not t.done():
                 t.cancel()
         await handler.aclose()

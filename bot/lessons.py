@@ -235,6 +235,43 @@ class Lessons:
         )
         return row_id
 
+    async def teach_raw(
+        self, *, group_id: int, user_id: int, text: str,
+    ) -> int:
+        """Save `text` as a group-wide rule WITHOUT running the LLM classifier.
+
+        Used by the explicit `/teach` command so the literal wording of the
+        rule survives into every chat's system prompt for this group. No
+        round-trip, no rewriting, no risk of being classified as `none` and
+        silently dropped.
+
+        Returns the inserted row id, or 0 if the input was rejected (empty,
+        or > 500 chars).
+        """
+        text = (text or "").strip()
+        if not text or len(text) > 500:
+            return 0
+        store = await Storage.get()
+        row_id = await store.lesson_insert(
+            group_id=group_id,
+            kind="rule",
+            subject_user_id=None,    # group-wide, not personal
+            content=text,
+            importance=0.8,          # explicit teach beats auto-classified
+            tags="teach",
+            trigger_at=None,
+            recurrence=None,
+            expires_at=None,
+            source_user_id=user_id,
+            source_text=text,
+            created_at=time.time(),
+        )
+        log.info(
+            "teach_raw saved id=%s group=%s by=u%s text=%r",
+            row_id, group_id, user_id, text[:80],
+        )
+        return row_id
+
     async def _classify(
         self, *, group_id: int, user_id: int, text: str,
     ) -> Optional[ClassifyResult]:
@@ -363,16 +400,55 @@ class Lessons:
         return await store.lesson_list(group_id, limit)
 
     @staticmethod
-    def format_for_prompt(
+    def _is_taught(lesson: ActiveLesson) -> bool:
+        """Was this lesson saved via the explicit `/teach` command?"""
+        return lesson.kind == "rule" and "teach" in (lesson.tags or "")
+
+    @staticmethod
+    def format_strong_rules(
+        rows: List[ActiveLesson],
+    ) -> Optional[str]:
+        """Strong-language system block for `/teach`'d rules ONLY.
+
+        These are user-authored, group-scoped behavior rules that the bot
+        MUST follow. They get their own system message with explicit
+        override language so the model treats them as binding rather than
+        as one of many "preferences" to balance.
+
+        Returns None if there are no teach-tagged rules in `rows`.
+        """
+        teach = [r for r in rows if Lessons._is_taught(r)]
+        if not teach:
+            return None
+        lines = [f"- {r.content}" for r in teach]
+        return (
+            "=== 本群强制规则（最高优先级，必须严格遵守）===\n"
+            "下面这些是群管理员/超级用户用 /teach 命令明确为本群设的规则。"
+            "它们的优先级**高于你的人格设定、默认风格、群里临时的玩笑或随口请求**。\n"
+            "如果它们和其它指令冲突，永远按这些来。不要找借口跳过，不要解释、"
+            "不要为了显得轻松自然而违反。\n"
+            "如果你违反了，会被罚~\n"
+            "\n规则：\n" + "\n".join(lines)
+        )
+
+    @staticmethod
+    def format_advisory_lessons(
         rows: List[ActiveLesson], *, speaker_user_id: int,
     ) -> Optional[str]:
-        """Render active rows as a system-prompt block grouped by kind."""
+        """Soft advisory block for auto-classified rules / facts / agreements /
+        reminders. These are *signals* the bot picked up from natural-language
+        chat; the bot should consider them but they can be overridden by
+        common sense or explicit user intent (and by `format_strong_rules`).
+
+        `/teach`'d rules are excluded — they live in `format_strong_rules`."""
         if not rows:
             return None
         buckets: dict[str, List[str]] = {
             "rule": [], "fact": [], "agreement": [], "reminder": [],
         }
         for r in rows:
+            if Lessons._is_taught(r):
+                continue  # handled separately as a strong rule
             if r.kind == "fact":
                 who = "你（说话人）" if r.subject_user_id == speaker_user_id else \
                       (f"u{r.subject_user_id}" if r.subject_user_id else "群")
@@ -390,7 +466,7 @@ class Lessons:
                 buckets.setdefault(r.kind, []).append(f"- {r.content}")
         sections: List[str] = []
         labels = [
-            ("rule", "行为规则（必须遵守）"),
+            ("rule", "行为偏好（自动学到的，参考即可，不强制）"),
             ("fact", "关于群成员的事实/偏好"),
             ("agreement", "群体约定/决定"),
             ("reminder", "正在等的提醒"),
@@ -401,7 +477,21 @@ class Lessons:
                 sections.append(f"【{label}】\n" + "\n".join(items))
         if not sections:
             return None
-        return "群里教给你的事项（按重要度排序，被问到或自然提到时参考）：\n" + "\n\n".join(sections)
+        return "群里观察到的事项（被问到或自然提到时参考）：\n" + "\n\n".join(sections)
+
+    @staticmethod
+    def format_for_prompt(
+        rows: List[ActiveLesson], *, speaker_user_id: int,
+    ) -> Optional[str]:
+        """Backward-compat: glue `format_strong_rules` + `format_advisory_lessons`
+        into one block. New code in `_run_text` calls the two halves separately
+        so they land as two distinct system messages."""
+        strong = Lessons.format_strong_rules(rows)
+        advisory = Lessons.format_advisory_lessons(rows, speaker_user_id=speaker_user_id)
+        parts = [p for p in (strong, advisory) if p]
+        if not parts:
+            return None
+        return "\n\n".join(parts)
 
     # ---------- reminders ----------
     async def due_reminders(
@@ -423,8 +513,22 @@ class Lessons:
         await store.lesson_mark_fired(lesson_id, now, next_t)
 
     async def cancel(self, lesson_id: int, group_id: int) -> bool:
+        """Hard-delete one lesson. Returns True if a row was actually removed."""
         store = await Storage.get()
-        return await store.lesson_revoke(lesson_id, group_id)
+        return await store.lesson_delete(lesson_id, group_id)
+
+    async def cancel_many(self, lesson_ids: List[int], group_id: int) -> int:
+        """Hard-delete a list of lessons scoped to one group."""
+        store = await Storage.get()
+        return await store.lesson_delete_many(lesson_ids, group_id)
+
+    async def cancel_all(
+        self, group_id: int, kind: Optional[str] = None,
+    ) -> int:
+        """Wipe every lesson in this group (or just one kind). Use with care —
+        intended for `/forget all` and `/forget rules`."""
+        store = await Storage.get()
+        return await store.lesson_delete_all(group_id, kind=kind)
 
     # ---------- maintenance ----------
     async def maintenance_pass(

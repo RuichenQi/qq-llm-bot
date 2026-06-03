@@ -30,16 +30,14 @@ def isolated_storage(tmp_path, monkeypatch):
     # Disable human-send delays in unit tests by default — tests that care
     # can re-enable it explicitly.
     monkeypatch.setattr(cfg.CONFIG, "human_send_enabled", False, raising=False)
-    # The important-memory classifier fires an extra LLM call per message;
-    # tests that don't opt in shouldn't see that behaviour leak into their
-    # stub provider's call log.
-    monkeypatch.setattr(cfg.CONFIG, "important_memory_enabled", False, raising=False)
-    # Lessons classifier likewise — addresses → extra LLM call.
+    # Lessons classifier fires an extra background LLM call per addressed
+    # message; off by default so stub call logs stay clean.
     monkeypatch.setattr(cfg.CONFIG, "lessons_enabled", False, raising=False)
     # Ambient gate uses random.random(); pin to deterministic always-pass for
     # tests that exercise non-addressed messages. Tests that want to verify
     # gating override this explicitly.
     monkeypatch.setattr(cfg.CONFIG, "ambient_reply_probability_high", 1.0, raising=False)
+    monkeypatch.setattr(cfg.CONFIG, "ambient_reply_probability_question", 1.0, raising=False)
     monkeypatch.setattr(cfg.CONFIG, "ambient_reply_probability_low", 1.0, raising=False)
     monkeypatch.setattr(cfg.CONFIG, "ambient_reply_min_seconds", 0, raising=False)
     # Quoted-image intent gate runs a vision call — switch it off for unit tests

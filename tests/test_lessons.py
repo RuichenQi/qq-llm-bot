@@ -169,6 +169,99 @@ def test_maybe_learn_persists_rule(monkeypatch, tmp_path):
     Storage._init_lock = None
 
 
+def test_teach_raw_is_per_group_and_skips_classifier(monkeypatch, tmp_path):
+    """teach_raw stores literal text scoped to one group, with no LLM call.
+
+    Per-group prompt injection: a rule taught in group A must not leak into
+    group B's chat-time recall."""
+    import config as cfg
+    from bot import storage as storage_mod
+    from bot.storage import Storage
+
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(cfg, "DB_FILE", db, raising=False)
+    monkeypatch.setattr(storage_mod, "DB_FILE", db, raising=False)
+    Storage._instance = None
+    Storage._init_lock = None
+
+    classifier_calls = []
+    stub = types.SimpleNamespace()
+
+    async def chat(messages, **kw):
+        classifier_calls.append(messages)
+        from providers.base import TextReply
+        return TextReply(text="{}", usage={}, model="stub")
+
+    stub.chat = chat
+    lessons = Lessons(stub)  # type: ignore[arg-type]
+
+    async def go():
+        # Two different groups; each teaches its own rule.
+        a_id = await lessons.teach_raw(
+            group_id=1, user_id=42,
+            text="本群讨论 ML 论文，回复时多引用 paper",
+        )
+        b_id = await lessons.teach_raw(
+            group_id=2, user_id=99, text="本群是英文群，请用英文回复",
+        )
+        assert a_id > 0 and b_id > 0
+        # Classifier was never called.
+        assert classifier_calls == []
+        # Group 1 sees A's rule but NOT B's.
+        active_a = await lessons.active_for_user(1, 42, limit=10)
+        contents_a = {a.content for a in active_a}
+        assert "本群讨论 ML 论文，回复时多引用 paper" in contents_a
+        assert "本群是英文群，请用英文回复" not in contents_a
+        # Group 2 sees B's rule but NOT A's.
+        active_b = await lessons.active_for_user(2, 99, limit=10)
+        contents_b = {a.content for a in active_b}
+        assert "本群是英文群，请用英文回复" in contents_b
+        assert "本群讨论 ML 论文，回复时多引用 paper" not in contents_b
+        # Both rows are kind=rule, subject=None (group-wide).
+        assert all(a.kind == "rule" for a in active_a + active_b)
+        assert all(a.subject_user_id is None for a in active_a + active_b)
+
+    asyncio.run(go())
+    Storage._instance = None
+    Storage._init_lock = None
+
+
+def test_teach_raw_rejects_empty_and_oversize(monkeypatch, tmp_path):
+    import config as cfg
+    from bot import storage as storage_mod
+    from bot.storage import Storage
+
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(cfg, "DB_FILE", db, raising=False)
+    monkeypatch.setattr(storage_mod, "DB_FILE", db, raising=False)
+    Storage._instance = None
+    Storage._init_lock = None
+
+    stub = types.SimpleNamespace()
+
+    async def chat(messages, **kw):
+        from providers.base import TextReply
+        return TextReply(text="{}", usage={}, model="stub")
+
+    stub.chat = chat
+    lessons = Lessons(stub)  # type: ignore[arg-type]
+
+    async def go():
+        assert await lessons.teach_raw(group_id=1, user_id=1, text="") == 0
+        assert await lessons.teach_raw(
+            group_id=1, user_id=1, text="x" * 600,
+        ) == 0
+        # Borderline: exactly 500 chars is accepted.
+        ok_id = await lessons.teach_raw(
+            group_id=1, user_id=1, text="x" * 500,
+        )
+        assert ok_id > 0
+
+    asyncio.run(go())
+    Storage._instance = None
+    Storage._init_lock = None
+
+
 def test_maybe_learn_skips_when_none(monkeypatch, tmp_path):
     import config as cfg
     from bot import storage as storage_mod

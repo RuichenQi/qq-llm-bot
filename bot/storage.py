@@ -216,6 +216,14 @@ class Storage:
         if migrate:
             await self._migrate_legacy_json()
             await self._migrate_memories_into_lessons()
+            # Now that everything is unified into `lessons`, drop the
+            # `memories` table so it stops showing up as residue in any
+            # ad-hoc SQL someone runs against the DB.
+            try:
+                await self._conn.execute("DROP TABLE IF EXISTS memories")
+                await self._conn.commit()
+            except aiosqlite.OperationalError as e:
+                log.warning("dropping legacy memories table failed: %s", e)
 
     async def _add_missing_lesson_columns(self) -> None:
         """Idempotent ALTER TABLE for any lesson columns added after the
@@ -581,6 +589,16 @@ class Storage:
             rows = await cur.fetchall()
         return [(float(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in rows]
 
+    async def group_memory_reset(self, group_id: int) -> int:
+        """Wipe the rolling chat log for one group. Returns rows deleted."""
+        assert self._conn is not None
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM group_memory WHERE group_id=?", (group_id,),
+            )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
     # ---------- daily recaps (long-term memory) ----------
     async def daily_recap_upsert(
         self, group_id: int, day: str, summary: str
@@ -643,204 +661,12 @@ class Storage:
             await self._conn.commit()
             return cur.rowcount or 0
 
-    # ---------- important memories ----------
-    async def memory_item_insert(
-        self,
-        *,
-        group_id: int,
-        subject_user_id: Optional[int],
-        content: str,
-        importance: float,
-        tags: str,
-        trigger_at: Optional[float],
-        recurrence: Optional[str],
-        expires_at: Optional[float],
-        created_at: float,
-        source_text: str,
-        source_nickname: str,
-    ) -> int:
+    async def daily_recap_reset(self, group_id: int) -> int:
+        """Wipe every daily recap for one group. Returns rows deleted."""
         assert self._conn is not None
         async with self._lock:
             cur = await self._conn.execute(
-                "INSERT INTO memories(group_id,subject_user_id,content,importance,"
-                " tags,trigger_at,recurrence,expires_at,created_at,status,"
-                " source_text,source_nickname)"
-                " VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)",
-                (
-                    group_id, subject_user_id, content[:500], float(importance),
-                    tags[:200], trigger_at, recurrence, expires_at, created_at,
-                    source_text[:500], source_nickname[:32],
-                ),
-            )
-            await self._conn.commit()
-            return int(cur.lastrowid or 0)
-
-    async def memory_item_due(
-        self, now_ts: float, limit: int = 50,
-    ) -> List[Tuple[int, int, Optional[int], str, str, Optional[str]]]:
-        """Pending items whose trigger_at <= now. Returns
-        (id, group_id, subject_user_id, content, source_nickname, recurrence)."""
-        assert self._conn is not None
-        async with self._conn.execute(
-            "SELECT id,group_id,subject_user_id,content,source_nickname,recurrence "
-            "FROM memories WHERE status='pending' AND trigger_at IS NOT NULL "
-            "AND trigger_at<=? ORDER BY trigger_at ASC LIMIT ?",
-            (now_ts, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [
-            (int(r[0]), int(r[1]),
-             int(r[2]) if r[2] is not None else None,
-             str(r[3]), str(r[4]),
-             str(r[5]) if r[5] is not None else None)
-            for r in rows
-        ]
-
-    async def memory_item_mark_fired(
-        self, item_id: int, fired_at: float, next_trigger: Optional[float] = None,
-    ) -> None:
-        """Mark fired. If next_trigger given (recurring), reschedule instead."""
-        assert self._conn is not None
-        async with self._lock:
-            if next_trigger is not None:
-                await self._conn.execute(
-                    "UPDATE memories SET trigger_at=?, fired_at=? WHERE id=?",
-                    (next_trigger, fired_at, item_id),
-                )
-            else:
-                await self._conn.execute(
-                    "UPDATE memories SET status='fired', fired_at=? WHERE id=?",
-                    (fired_at, item_id),
-                )
-            await self._conn.commit()
-
-    async def memory_item_cancel(self, item_id: int, group_id: int) -> bool:
-        assert self._conn is not None
-        async with self._lock:
-            cur = await self._conn.execute(
-                "UPDATE memories SET status='cancelled' "
-                "WHERE id=? AND group_id=? AND status='pending'",
-                (item_id, group_id),
-            )
-            await self._conn.commit()
-            return (cur.rowcount or 0) > 0
-
-    async def memory_item_recall(
-        self,
-        group_id: int,
-        subject_user_id: int,
-        now_ts: float,
-        limit: int = 8,
-    ) -> List[Tuple[int, Optional[int], str, float, str, Optional[float]]]:
-        """Rows relevant for context injection. Returns
-        (id, subject_user_id, content, importance, tags, trigger_at).
-        Ranks personal items above group-wide, then by importance × recency."""
-        assert self._conn is not None
-        async with self._conn.execute(
-            "SELECT id,subject_user_id,content,importance,tags,trigger_at "
-            "FROM memories WHERE group_id=? "
-            "AND status IN ('pending','fired') "
-            "AND (subject_user_id IS NULL OR subject_user_id=?) "
-            "AND (expires_at IS NULL OR expires_at>?) "
-            "ORDER BY "
-            "  (subject_user_id IS NULL) ASC, "      # personal first
-            "  importance DESC, "
-            "  created_at DESC "
-            "LIMIT ?",
-            (group_id, subject_user_id, now_ts, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [
-            (int(r[0]),
-             int(r[1]) if r[1] is not None else None,
-             str(r[2]), float(r[3]), str(r[4]),
-             float(r[5]) if r[5] is not None else None)
-            for r in rows
-        ]
-
-    async def memory_item_list_pending(
-        self, group_id: int, subject_user_id: Optional[int] = None, limit: int = 20,
-    ) -> List[Tuple[int, Optional[int], str, Optional[float], Optional[str]]]:
-        """Pending items for /remember list. Returns (id, subject_user_id,
-        content, trigger_at, recurrence)."""
-        assert self._conn is not None
-        if subject_user_id is None:
-            sql = ("SELECT id,subject_user_id,content,trigger_at,recurrence "
-                   "FROM memories WHERE group_id=? AND status='pending' "
-                   "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?")
-            params = (group_id, limit)
-        else:
-            sql = ("SELECT id,subject_user_id,content,trigger_at,recurrence "
-                   "FROM memories WHERE group_id=? AND status='pending' "
-                   "AND (subject_user_id IS NULL OR subject_user_id=?) "
-                   "ORDER BY trigger_at IS NULL, trigger_at ASC LIMIT ?")
-            params = (group_id, subject_user_id, limit)
-        async with self._conn.execute(sql, params) as cur:
-            rows = await cur.fetchall()
-        return [
-            (int(r[0]),
-             int(r[1]) if r[1] is not None else None,
-             str(r[2]),
-             float(r[3]) if r[3] is not None else None,
-             str(r[4]) if r[4] is not None else None)
-            for r in rows
-        ]
-
-    async def memory_item_expire(self, now_ts: float) -> int:
-        """Cancel rows past their expires_at. Returns rows touched."""
-        assert self._conn is not None
-        async with self._lock:
-            cur = await self._conn.execute(
-                "UPDATE memories SET status='cancelled' "
-                "WHERE status='pending' AND expires_at IS NOT NULL "
-                "AND expires_at<=?",
-                (now_ts,),
-            )
-            await self._conn.commit()
-            return cur.rowcount or 0
-
-    async def memory_item_prune(self, keep_days: int) -> int:
-        """Hard-delete fired/cancelled rows older than keep_days."""
-        assert self._conn is not None
-        cutoff = __import__("time").time() - keep_days * 86400
-        async with self._lock:
-            cur = await self._conn.execute(
-                "DELETE FROM memories WHERE status IN ('fired','cancelled') "
-                "AND COALESCE(fired_at, created_at) < ?",
-                (cutoff,),
-            )
-            await self._conn.commit()
-            return cur.rowcount or 0
-
-    async def memory_item_dedup_candidates(
-        self, group_id: int, limit: int = 50,
-    ) -> List[Tuple[int, Optional[int], str, str, float]]:
-        """Recent pending+fired items in this group, for the LLM dedup pass.
-        Returns (id, subject_user_id, content, tags, created_at)."""
-        assert self._conn is not None
-        async with self._conn.execute(
-            "SELECT id,subject_user_id,content,tags,created_at "
-            "FROM memories WHERE group_id=? AND status IN ('pending','fired') "
-            "ORDER BY created_at DESC LIMIT ?",
-            (group_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [
-            (int(r[0]),
-             int(r[1]) if r[1] is not None else None,
-             str(r[2]), str(r[3]), float(r[4]))
-            for r in rows
-        ]
-
-    async def memory_item_delete_many(self, ids: List[int]) -> int:
-        if not ids:
-            return 0
-        assert self._conn is not None
-        qs = ",".join("?" * len(ids))
-        async with self._lock:
-            cur = await self._conn.execute(
-                f"DELETE FROM memories WHERE id IN ({qs})",
-                tuple(ids),
+                "DELETE FROM daily_recaps WHERE group_id=?", (group_id,),
             )
             await self._conn.commit()
             return cur.rowcount or 0
@@ -911,12 +737,17 @@ class Storage:
     async def lesson_list(
         self, group_id: int, limit: int = 50,
     ) -> List[Tuple[int, str, str, float, str, Optional[float], Optional[str]]]:
-        """All lessons for /admin. Returns
-        (id, kind, content, importance, status, trigger_at, recurrence)."""
+        """All ACTIVE lessons in this group, for /admin.
+
+        Returns (id, kind, content, importance, status, trigger_at, recurrence).
+        Filters out stale 'revoked'/'fired'/'cancelled' rows that may linger
+        from a pre-hard-delete DB; cancel now physically removes rows, so this
+        filter is just belt-and-suspenders.
+        """
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT id,kind,content,importance,status,trigger_at,recurrence "
-            "FROM lessons WHERE group_id=? "
+            "FROM lessons WHERE group_id=? AND status='active' "
             "ORDER BY created_at DESC LIMIT ?",
             (group_id, limit),
         ) as cur:
@@ -986,7 +817,8 @@ class Storage:
         self, lesson_id: int, fired_at: float,
         next_trigger: Optional[float] = None,
     ) -> None:
-        """Mark fired (or reschedule for recurring rows)."""
+        """Recurring → reschedule with the next trigger.
+        One-shot → hard-delete (no residue once it fires)."""
         assert self._conn is not None
         async with self._lock:
             if next_trigger is not None:
@@ -995,76 +827,101 @@ class Storage:
                     (next_trigger, fired_at, lesson_id),
                 )
             else:
-                # One-shot reminders go to 'fired'; rules/facts with no trigger
-                # stay 'active' regardless. We only flip status when this row
-                # actually had a trigger_at (caller already filtered).
+                # One-shot reminder has done its job — drop the row entirely.
+                # Rules/facts/agreements have trigger_at=NULL so they're
+                # filtered out by the due-reminder query and never come here.
                 await self._conn.execute(
-                    "UPDATE lessons SET status='fired', fired_at=? "
+                    "DELETE FROM lessons "
                     "WHERE id=? AND trigger_at IS NOT NULL",
-                    (fired_at, lesson_id),
+                    (lesson_id,),
                 )
             await self._conn.commit()
 
-    async def lesson_revoke(self, lesson_id: int, group_id: int) -> bool:
+    # Cancel = HARD DELETE. The old design used `status='revoked'` so that
+    # `/admin lessons` could show the audit trail, but in practice this read
+    # as "the bot still kinda remembers what I told it to forget". Cancelled
+    # rows are now physically gone — no surface, no residue, no risk that a
+    # downstream query forgot to filter the status column.
+
+    async def lesson_delete(self, lesson_id: int, group_id: int) -> bool:
+        """Hard-delete one row. Returns True if a row was actually removed."""
         assert self._conn is not None
         async with self._lock:
             cur = await self._conn.execute(
-                "UPDATE lessons SET status='revoked' "
-                "WHERE id=? AND group_id=? AND status='active'",
+                "DELETE FROM lessons WHERE id=? AND group_id=?",
                 (lesson_id, group_id),
             )
             await self._conn.commit()
             return (cur.rowcount or 0) > 0
 
-    async def lesson_revoke_many(self, ids: List[int], group_id: int) -> int:
+    async def lesson_delete_many(self, ids: List[int], group_id: int) -> int:
+        """Hard-delete a list of rows scoped to one group. Returns count."""
         if not ids:
             return 0
         assert self._conn is not None
         qs = ",".join("?" * len(ids))
         async with self._lock:
             cur = await self._conn.execute(
-                f"UPDATE lessons SET status='revoked' "
-                f"WHERE group_id=? AND status='active' AND id IN ({qs})",
+                f"DELETE FROM lessons WHERE group_id=? AND id IN ({qs})",
                 (group_id, *ids),
             )
             await self._conn.commit()
             return cur.rowcount or 0
 
+    async def lesson_delete_all(
+        self, group_id: int, kind: Optional[str] = None,
+    ) -> int:
+        """Wipe every lesson in this group. If `kind` is given (e.g. 'rule'),
+        only that kind is deleted."""
+        assert self._conn is not None
+        async with self._lock:
+            if kind is None:
+                cur = await self._conn.execute(
+                    "DELETE FROM lessons WHERE group_id=?",
+                    (group_id,),
+                )
+            else:
+                cur = await self._conn.execute(
+                    "DELETE FROM lessons WHERE group_id=? AND kind=?",
+                    (group_id, kind),
+                )
+            await self._conn.commit()
+            return cur.rowcount or 0
+
+    # Legacy aliases (kept so any direct callers / tests don't break). All
+    # routes through to the hard-delete path now.
+    async def lesson_revoke(self, lesson_id: int, group_id: int) -> bool:
+        return await self.lesson_delete(lesson_id, group_id)
+
+    async def lesson_revoke_many(self, ids: List[int], group_id: int) -> int:
+        return await self.lesson_delete_many(ids, group_id)
+
     async def lesson_expire(self, now_ts: float) -> int:
-        """Revoke rows past expires_at. Returns rows touched."""
+        """Hard-delete rows past expires_at. Returns count."""
         assert self._conn is not None
         async with self._lock:
             cur = await self._conn.execute(
-                "UPDATE lessons SET status='revoked' "
-                "WHERE status='active' AND expires_at IS NOT NULL "
-                "AND expires_at<=?",
+                "DELETE FROM lessons "
+                "WHERE expires_at IS NOT NULL AND expires_at<=?",
                 (now_ts,),
             )
             await self._conn.commit()
             return cur.rowcount or 0
 
     async def lesson_prune(self, keep_days: int) -> int:
-        """Hard-delete fired/revoked rows older than keep_days."""
-        assert self._conn is not None
-        cutoff = __import__("time").time() - keep_days * 86400
-        async with self._lock:
-            cur = await self._conn.execute(
-                "DELETE FROM lessons WHERE status IN ('fired','revoked') "
-                "AND COALESCE(fired_at, created_at) < ?",
-                (cutoff,),
-            )
-            await self._conn.commit()
-            return cur.rowcount or 0
+        """No-op since cancel/fire/expire all hard-delete. Kept on the
+        interface so the maintenance loop can call it unchanged."""
+        return 0
 
     async def lesson_dedup_candidates(
         self, group_id: int, limit: int = 50,
     ) -> List[Tuple[int, str, Optional[int], str, str, float]]:
-        """Recent active+fired items, for the LLM dedup pass.
+        """Recent items in this group, for the LLM dedup pass.
         Returns (id, kind, subject_user_id, content, tags, created_at)."""
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT id,kind,subject_user_id,content,tags,created_at "
-            "FROM lessons WHERE group_id=? AND status IN ('active','fired') "
+            "FROM lessons WHERE group_id=? "
             "ORDER BY created_at DESC LIMIT ?",
             (group_id, limit),
         ) as cur:

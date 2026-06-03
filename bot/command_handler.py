@@ -138,17 +138,23 @@ HELP_MSG = (
     "/recap [今天|昨天|1h|1d|一周]   总结群里活动\n"
     "/recall [YYYY-MM-DD|关键词]    查长时记忆\n"
     "/timewarp [一年前|半年前|YYYY-MM]  怀旧短文\n"
-    "/dream                让我现在做个梦（仅管理员）\n"
+    "/news [主题]         联网扒一段当下热点发到群里\n"
+    "                      （任何人都能用；不带主题就用默认搜索 query）\n"
     "—— 功能注入（规则/事实/约定/提醒）——\n"
-    "/teach <规则>         教我一条今后要遵守的规则\n"
-    "/remember [list|cancel <id>]   看/取消我记着的事\n"
-    "/forget <id>          忘掉一条（=/remember cancel <id>）\n"
+    "/teach <规则>         给本群单独定一条规则（注入到每次对话）\n"
+    "                      （和别的群互不影响）\n"
+    "/remember             看我在本群记着的事\n"
+    "/forget <id>          忘掉一条；支持多个：/forget 5 7 9 或 /forget 5,7,9\n"
+    "/forget rules         忘掉本群所有规则（保留事实/约定/提醒）\n"
+    "/forget all           忘掉本群所有记录（清干净）\n"
     "—— 杂项 ——\n"
     "/start                让我在本群上线（仅管理员）\n"
     "/stop                 让我在本群下线（仅管理员）\n"
-    "/reset                清空我和你的对话记忆\n"
+    "/clear                清空我和你的对话记忆（只影响你）\n"
     "/balance              查看今日额度\n"
     "/help                 显示帮助\n"
+    "（管理员还可以 /admin clear <user> 清单个用户、\n"
+    "  /admin reset confirm 清空本群所有记录）\n"
     "（直接 @我 聊天也行～）"
 )
 
@@ -476,9 +482,8 @@ class Handler:
         args = msg.command_args
         if c == "help":
             await self._reply(msg.group_id, HELP_MSG)
-        elif c == "reset":
-            await self.memory.reset(msg.group_id, msg.user_id)
-            await self._reply(msg.group_id, "已清空你的对话记忆~")
+        elif c == "clear":
+            await self._run_clear(msg)
         elif c == "balance":
             await self._reply(msg.group_id, await self._format_balance(msg))
         elif c == "ask":
@@ -504,17 +509,27 @@ class Handler:
         elif c == "remember":
             await self._run_remember(msg, args)
         elif c == "forget":
-            # Alias for `/remember cancel <id>` so users can drop a lesson
-            # without remembering the longer form.
-            await self._run_remember(msg, f"cancel {args}".strip())
+            # Shortcut for the cancel path. Accepts the same arg shapes as
+            # /remember cancel: single id, space/comma-separated ids,
+            # "rules" / "all" / a kind alias.
+            if not CONFIG.lessons_enabled or self.lessons is None:
+                await self._reply(msg.group_id, "功能注入未启用~")
+                return
+            await self._do_bulk_cancel(
+                msg, args,
+                usage_hint=(
+                    "用法: /forget <id> | <id1,id2,...> | "
+                    "rules|facts|agreements|reminders | all"
+                ),
+            )
         elif c == "search":
             # Use args explicitly — falling back to msg.text would pass "/search"
             # as the query when the user types the bare command.
             await self._run_search(msg, args)
         elif c == "teach":
             await self._run_teach(msg, args)
-        elif c == "dream":
-            await self._run_dream(msg)
+        elif c == "news":
+            await self._run_news(msg, args)
         elif c == "start":
             await self._run_start(msg)
         elif c == "stop":
@@ -534,20 +549,20 @@ class Handler:
         if sub in ("", "help"):
             await self._reply(
                 msg.group_id,
-                "/admin status               本群今日路由用量\n"
-                "/admin usage                所有群今日用量\n"
-                "/admin reset_quota          清空今日额度\n"
-                "/admin reset_memory <uid>   清空指定用户对话记忆\n"
-                "/admin reset_memory all     清空本群所有人记忆\n"
-                "/admin allow_group <gid>    允许新的群\n"
-                "/admin disallow_group <gid> 禁用某群 (env 中的群无法移除)\n"
-                "/admin list_groups          显示所有允许的群\n"
-                "/admin report               立即推送一次日报\n"
-                "/admin ping                 OneBot 连接状态与最近心跳\n"
-                "/admin save_recap [day]     手动写入某天的长时记忆\n"
-                "/admin lessons              查看本群学到的行为规则/事实/约定\n"
-                "/admin forget_lesson <id>   忘掉一条 lesson\n"
-                "（普通指令：/help；任何超级用户也可以 /dream 强制做梦）",
+                "/admin status                本群今日路由用量\n"
+                "/admin usage                 所有群今日用量\n"
+                "/admin reset_quota           清空今日额度\n"
+                "/admin clear <uid|@user>     清空指定用户在本群的对话记忆\n"
+                "/admin reset confirm         清空本群所有记录（不可撤销）\n"
+                "/admin allow_group <gid>     允许新的群\n"
+                "/admin disallow_group <gid>  禁用某群 (env 中的群无法移除)\n"
+                "/admin list_groups           显示所有允许的群\n"
+                "/admin report                立即推送一次日报\n"
+                "/admin ping                  OneBot 连接状态与最近心跳\n"
+                "/admin save_recap [day]      手动写入某天的长时记忆\n"
+                "（lessons / 提醒 用普通指令 /remember 和 /forget 管即可——\n"
+                " 它们对超级用户也生效，没有专门的 /admin 版本）\n"
+                "（普通指令清单见 /help）",
             )
             return
         if sub == "status":
@@ -564,15 +579,15 @@ class Handler:
             await self.quota.admin_reset()
             await self._reply(msg.group_id, "已清空今日额度~")
             return
-        if sub == "reset_memory":
-            if rest == "all":
-                await self.memory.admin_reset_group(msg.group_id)
-                await self._reply(msg.group_id, f"已清空群 {msg.group_id} 的所有对话记忆")
-            elif rest.isdigit():
-                await self.memory.reset(msg.group_id, int(rest))
-                await self._reply(msg.group_id, f"已清空用户 {rest} 的对话记忆")
-            else:
-                await self._reply(msg.group_id, "用法: /admin reset_memory <user_id|all>")
+        if sub == "clear":
+            await self._run_admin_clear(msg, rest)
+            return
+        if sub == "reset":
+            # Full per-group wipe: memory + group_memory + daily_recaps +
+            # lessons. The `confirm` arg below is intentional friction; bare
+            # `/admin reset` only shows usage so a misclick can't destroy the
+            # group state.
+            await self._run_reset(msg, rest)
             return
         if sub == "allow_group":
             if not rest.isdigit():
@@ -610,48 +625,9 @@ class Handler:
         if sub == "ping":
             await self._reply(msg.group_id, self._format_ping())
             return
-        if sub == "lessons":
-            if self.lessons is None:
-                await self._reply(msg.group_id, "lessons 模块未启用")
-                return
-            rows = await self.lessons.list_all(msg.group_id, limit=50)
-            if not rows:
-                await self._reply(msg.group_id, "本群还没教过我什么~")
-                return
-            kind_label = {
-                "rule": "规则", "fact": "事实",
-                "agreement": "约定", "reminder": "提醒",
-            }
-            lines = [f"群 {msg.group_id} 学到的事项："]
-            for _id, kind, content, imp, status, trigger_at, recurrence in rows:
-                tag = "" if status == "active" else f" [{status}]"
-                t_part = ""
-                if trigger_at:
-                    t_part = (
-                        f" @{datetime.fromtimestamp(trigger_at).strftime('%m-%d %H:%M')}"
-                    )
-                if recurrence:
-                    t_part += f" ({recurrence})"
-                label = kind_label.get(kind, kind)
-                lines.append(
-                    f"#{_id} [{label}] ({imp:.2f}){tag}{t_part} {content}"
-                )
-            lines.append("\n忘掉: /admin forget_lesson <id>")
-            await self._reply(msg.group_id, "\n".join(lines))
-            return
-        if sub == "forget_lesson":
-            if self.lessons is None:
-                await self._reply(msg.group_id, "lessons 模块未启用")
-                return
-            if not rest.isdigit():
-                await self._reply(msg.group_id, "用法: /admin forget_lesson <id>")
-                return
-            ok = await self.lessons.cancel(int(rest), msg.group_id)
-            await self._reply(
-                msg.group_id,
-                f"已忘记 #{rest}" if ok else "没找到这条（或已经忘了）",
-            )
-            return
+        # /admin lessons and /admin forget_lesson were removed: they were
+        # duplicates of /remember and /forget. Lessons and reminders are now
+        # a single unified concept managed through the user-facing commands.
         if sub == "save_recap":
             # /admin save_recap [yesterday|today|YYYY-MM-DD]
             if self.long_memory is None:
@@ -718,13 +694,26 @@ class Handler:
         # message wasn't directly addressed (no @, no nickname in text), throttle
         # with tier-specific probability + per-group cooldown so the bot doesn't
         # pile onto every conversation. Directly-addressed messages bypass entirely.
+        #
+        # Tier matrix:
+        #   high     — router said "real hook" AND not a question
+        #   question — router said "real hook" AND text looks like a question
+        #              (most such questions are aimed at a specific other user,
+        #              so the bot chiming in is intrusive; uses its own, lower p)
+        #   low      — router classified as low engagement (banter, reactions)
         addressed = was_at_bot or (
             CONFIG.bot_nickname and CONFIG.bot_nickname in msg.text
         )
         if not addressed:
             tier = decision.tier
-            p = (CONFIG.ambient_reply_probability_high if tier == "high"
-                 else CONFIG.ambient_reply_probability_low)
+            if tier == "high" and self._looks_like_question(msg.text):
+                tier = "question"
+            if tier == "high":
+                p = CONFIG.ambient_reply_probability_high
+            elif tier == "question":
+                p = CONFIG.ambient_reply_probability_question
+            else:
+                p = CONFIG.ambient_reply_probability_low
             elapsed = time.monotonic() - self._last_bot_speech_at.get(msg.group_id, 0.0)
             if elapsed < CONFIG.ambient_reply_min_seconds:
                 log.info(
@@ -735,12 +724,12 @@ class Handler:
                 return
             if random.random() >= p:
                 log.info(
-                    "ambient gate: dice skip (tier=%s, p=%.2f)", tier, p,
+                    "ambient gate: dice skip (tier=%s, p=%.3f)", tier, p,
                 )
                 self._last_dispatch_at.pop(msg.group_id, None)
                 return
             log.info(
-                "ambient gate: passed (tier=%s, p=%.2f, elapsed=%.1fs)",
+                "ambient gate: passed (tier=%s, p=%.3f, elapsed=%.1fs)",
                 tier, p, elapsed,
             )
 
@@ -906,36 +895,181 @@ class Handler:
         await self._run_deepseek_chat(msg, prompt)
 
     async def _run_teach(self, msg: ParsedMessage, rule: str) -> None:
-        """`/teach <rule>` — explicitly save a behavioral rule / fact /
-        agreement / reminder. Bypasses the keyword pre-filter (since the user
-        is intentionally teaching), but still runs the LLM classifier so the
-        right `kind` and trigger_at get filled in."""
+        """`/teach <rule>` — explicit per-group prompt injection.
+
+        Stores `rule` verbatim as a group-scoped lesson (kind=rule,
+        subject_user_id=None, importance=0.8). Skips the LLM classifier so:
+          * the exact wording survives into the system prompt every chat turn
+          * no risk of being rejected as "not a rule"
+          * no extra round-trip / token cost
+
+        Use natural-language @-mention if you want the smart classifier to
+        decide between rule / fact / agreement / reminder.
+        """
         rule = (rule or "").strip()
         if not rule:
             await self._reply(
                 msg.group_id,
-                "用法: /teach <规则/事实/约定>，比如 /teach 群里有人发666你也跟一个",
+                "用法: /teach <规则>，比如 /teach 本群讨论 ML 论文，回复时多引用 paper",
             )
             return
         if not CONFIG.lessons_enabled or self.lessons is None:
             await self._reply(msg.group_id, "功能注入没开~")
             return
         try:
-            row_id = await self.lessons.maybe_learn(
-                group_id=msg.group_id, user_id=msg.user_id,
-                text=rule, addressed=True,
+            row_id = await self.lessons.teach_raw(
+                group_id=msg.group_id, user_id=msg.user_id, text=rule,
             )
         except Exception:
             log.exception("/teach lesson save crashed")
             await self._reply(msg.group_id, "记不住，过会再说~")
             return
         if row_id:
-            await self._human_send(msg.group_id, f"好的，记下了（#{row_id}）")
+            await self._human_send(
+                msg.group_id, f"好的，本群记下了（#{row_id}）",
+            )
         else:
             await self._human_send(
                 msg.group_id,
-                "这条没存下来（看起来不像一条要长期遵守的规则）",
+                "这条没存下来，太长了（最多 500 字）",
             )
+
+    async def _run_clear(self, msg: ParsedMessage) -> None:
+        """`/clear` — clear MY (this user's) conversation memory in this group.
+
+        Any user can call this for themselves; doesn't touch other users'
+        memory or any group-wide state. Admin-targeted per-user clearing
+        is `/admin clear <uid|@user>`; full group wipe is `/admin reset confirm`.
+        """
+        await self.memory.reset(msg.group_id, msg.user_id)
+        await self._human_send(msg.group_id, "已清空你的对话记忆~")
+
+    @staticmethod
+    def _resolve_target_user(msg: ParsedMessage, arg: str) -> Optional[int]:
+        """Pick a target user id out of either an explicit argument or an
+        @-mention in the message. Returns None when neither is present.
+
+        Accepts:
+          * a bare QQ number: `/admin clear 1234567`
+          * an @-mention of someone else: `/admin clear @张三`
+            (`msg.at_targets[0]` is usually the bot itself — we skip self_id)
+        """
+        token = (arg or "").strip()
+        if token.isdigit():
+            return int(token)
+        # Allow `@1234567` literal in case the user pasted a raw at-syntax.
+        if token.startswith("@") and token[1:].isdigit():
+            return int(token[1:])
+        # Fall back to the first @-mention that isn't the bot itself.
+        others = [u for u in msg.at_targets if u != msg.self_id]
+        if others:
+            return others[0]
+        return None
+
+    async def _run_admin_clear(self, msg: ParsedMessage, rest: str) -> None:
+        """`/admin clear <uid|@user>` — wipe one user's conversation memory
+        in this group. Super-user only (caller dispatch already enforced)."""
+        target = self._resolve_target_user(msg, rest)
+        if target is None:
+            await self._reply(
+                msg.group_id,
+                "用法: /admin clear <user_id> 或 /admin clear @user",
+            )
+            return
+        if target == msg.self_id:
+            await self._reply(msg.group_id, "我自己的记忆不能这么清~")
+            return
+        n = await self.memory.reset(msg.group_id, target)
+        log.info(
+            "admin clear: group=%s target=%s by user=%s rows=%s",
+            msg.group_id, target, msg.user_id, n,
+        )
+        # `Memory.reset` returns None — we don't have a count, so report
+        # without numbers. The user knows what they asked for.
+        await self._human_send(
+            msg.group_id,
+            f"已清空用户 {target} 在本群的对话记忆",
+        )
+
+    async def _run_reset(self, msg: ParsedMessage, args: str) -> None:
+        """`/reset confirm` — nuke EVERYTHING for this group. Super-user only.
+
+        Wipes (per-group, in one shot):
+          - every user's conversation memory (`memory` table)
+          - the rolling group chat log (`group_memory`)
+          - long-term daily recaps (`daily_recaps`)
+          - every lesson (rules / facts / agreements / reminders)
+        Does NOT touch:
+          - the allow-list (bot stays allowed here)
+          - the pause state (`group_pause`)
+          - bot-wide stuff: quotas, image disk cache, daily-report bookkeeping
+
+        Reachable via `/admin reset confirm`. Requires the literal word
+        `confirm` (or `确认`/`是`) as the only arg — bare `/admin reset`
+        shows usage. Callers (admin dispatch) have already verified that
+        the user is a super-user.
+        """
+        token = (args or "").strip().lower()
+        if token not in ("confirm", "确认", "是"):
+            await self._reply(
+                msg.group_id,
+                "/admin reset 会清空本群所有记录："
+                "对话记忆 + 群聊日志 + 长时记忆 + 全部 lessons。\n"
+                "确认请发：/admin reset confirm\n"
+                "（不可撤销；想清单个用户用 /admin clear <uid|@user>；"
+                "想清自己用 /clear）",
+            )
+            return
+        # Run the wipes. Collect counts so we can report what happened.
+        counts: Dict[str, int] = {}
+        try:
+            counts["memory"] = await self.memory.admin_reset_group(msg.group_id)
+        except Exception:
+            log.exception("/reset memory wipe failed")
+            counts["memory"] = -1
+        try:
+            counts["group_memory"] = await self.group_memory.reset_group(msg.group_id)
+        except Exception:
+            log.exception("/reset group_memory wipe failed")
+            counts["group_memory"] = -1
+        try:
+            counts["daily_recaps"] = (
+                await self.long_memory.reset_group(msg.group_id)
+                if self.long_memory is not None else 0
+            )
+        except Exception:
+            log.exception("/reset daily_recaps wipe failed")
+            counts["daily_recaps"] = -1
+        try:
+            counts["lessons"] = (
+                await self.lessons.cancel_all(msg.group_id)
+                if self.lessons is not None else 0
+            )
+        except Exception:
+            log.exception("/reset lessons wipe failed")
+            counts["lessons"] = -1
+        # Also flush in-memory bookkeeping that gates ambient replies, so the
+        # bot doesn't feel "stuck" on stale state right after a reset.
+        self._last_dispatch_at.pop(msg.group_id, None)
+        self._last_bot_speech_at.pop(msg.group_id, None)
+        self._msgs_since_bot_spoke.pop(msg.group_id, None)
+        # Wipe the image-cache entries scoped to this group.
+        for key in [k for k in self._last_image if k[0] == msg.group_id]:
+            self._last_image.pop(key, None)
+        log.info(
+            "FULL RESET group=%s by user=%s counts=%s",
+            msg.group_id, msg.user_id, counts,
+        )
+        body = (
+            "已重置本群全部记录：\n"
+            f"  对话记忆: {counts['memory']} 条\n"
+            f"  群聊日志: {counts['group_memory']} 条\n"
+            f"  长时记忆: {counts['daily_recaps']} 条\n"
+            f"  lessons:  {counts['lessons']} 条"
+        )
+        # log_to_memory=False so the ack doesn't immediately re-pollute the
+        # group_memory table we just wiped.
+        await self._human_send(msg.group_id, body, log_to_memory=False)
 
     async def _run_start(self, msg: ParsedMessage) -> None:
         """`/start` — un-pause the bot in this group. Super-user only."""
@@ -969,22 +1103,43 @@ class Handler:
         else:
             await self._human_send(msg.group_id, "我已经在休息啦")
 
-    async def _run_dream(self, msg: ParsedMessage) -> None:
-        """`/dream` — force the overnight dream routine to run now. Super-user
-        only since it consumes a deepseek call and is mainly a debugging aid."""
-        if msg.user_id not in CONFIG.superusers:
-            await self._reply(msg.group_id, "/dream 仅限超级用户使用~")
-            return
-        if self.long_memory is None:
-            await self._reply(msg.group_id, "长时记忆没开，没法编梦~")
-            return
-        recaps = await self.long_memory.recent(msg.group_id, days=5)
-        if not recaps:
+    async def _run_news(self, msg: ParsedMessage, args: str) -> None:
+        """`/news [topic]` — fetch a fresh batch of headlines and post a
+        short paragraph summary to THIS group.
+
+        Available to anyone (not just superusers); the cost is bounded by
+        the user-rate-limit + per-group reply cooldown that already gate
+        every `/command`. Bypasses the daily-loop's per-group min-interval
+        on the assumption that an explicit request wants results NOW.
+
+        `/news` with no args uses the configured `NEWS_QUERY` (broad).
+        `/news GPU 涨价` searches that phrase instead.
+        """
+        if self.web_search is None:
             await self._human_send(
-                msg.group_id, "本群最近没什么记忆，做不出梦来",
+                msg.group_id,
+                "联网搜索还没配置呢（管理员要去填 TAVILY_API_KEY）",
             )
             return
-        await self.send_dream(msg.group_id, recaps)
+        user_topic = (args or "").strip()
+        # Polite refusal ONLY fires when the USER explicitly typed a sensitive
+        # topic — bare `/news` with no args (using the default broad query)
+        # should never imply "I'm refusing your topic", since they didn't
+        # name one. If the default itself somehow trips the gate, the
+        # downstream send_news silently bails and we fall through to the
+        # generic "今早没刷到啥能聊的" message below.
+        if user_topic and _query_is_blocked(user_topic):
+            log.info("/news blocked sensitive user query: %r", user_topic[:120])
+            await self._human_send(
+                msg.group_id, "这个话题我不方便聊，要不换个主题？",
+            )
+            return
+        query = user_topic or CONFIG.news_query
+        ok = await self.send_news(msg.group_id, query=query)
+        if not ok:
+            await self._human_send(
+                msg.group_id, "今早没刷到啥能聊的（搜索没结果或调用失败）",
+            )
 
     async def _run_file_qa(self, msg: ParsedMessage, prompt: str) -> None:
         """/file <question> — answer based on file content already injected
@@ -1307,6 +1462,29 @@ class Handler:
         nick = CONFIG.bot_nickname
         return bool(nick) and nick in (msg.text or "")
 
+    # Question detection for the ambient gate. A "question" message is usually
+    # aimed at another specific user (not the group as a whole), so the bot
+    # interjecting feels intrusive. Three signals — any one triggers:
+    #   1. an explicit '?' or '？' anywhere
+    #   2. a Chinese question particle 吗/呢/么/嘛 at the very end (after any
+    #      trailing punct / whitespace)
+    #   3. a WH-word lexicalised in Chinese: 为什么 / 为啥 / 咋办 / 哪里 / 哪儿 /
+    #      多少钱 / 几时 / 啥时候
+    # Common false positives to be aware of: "啥都行" / "怎么都行" — both have
+    # 啥/怎么 but aren't questions. The WH-word pattern requires a more specific
+    # phrasing (e.g. 怎么办, not bare 怎么) to limit those misfires.
+    _QUESTION_RE = re.compile(
+        r"[?？]"
+        r"|[吗呢么嘛][。\s!！~～\.]*$"
+        r"|(?:为什么|为啥|咋办|怎么办|哪里|哪儿|多少钱|几时|啥时候|什么时候)"
+    )
+
+    @classmethod
+    def _looks_like_question(cls, text: str) -> bool:
+        if not text:
+            return False
+        return cls._QUESTION_RE.search(text) is not None
+
     async def _safe_learn_lesson(
         self, group_id: int, user_id: int, text: str, addressed: bool,
     ) -> None:
@@ -1353,9 +1531,14 @@ class Handler:
         messages: List[ChatMessage] = [
             ChatMessage(role="system", content=load_persona()),
         ]
-        # Unified lessons: rules + facts + agreements + reminders injected
-        # right after persona so they shape every response. Personal items
-        # (subject_user_id=speaker) rank above group-wide ones.
+        # Unified lessons, in two tiers:
+        #   1. STRONG block — explicit `/teach`'d rules. Posted as a separate
+        #      system message with override language so the model treats it
+        #      as binding, not as one more "preference" to balance.
+        #   2. ADVISORY block — auto-classified rules / facts / agreements /
+        #      reminders from natural-language chat. Softer wording so the
+        #      bot doesn't get whipsawed by every off-the-cuff statement.
+        # Both are group-scoped via active_for_user(group_id, user_id).
         if CONFIG.lessons_enabled and self.lessons is not None:
             try:
                 active = await self.lessons.active_for_user(
@@ -1365,9 +1548,14 @@ class Handler:
             except Exception:
                 log.exception("lessons recall failed")
                 active = []
-            block = Lessons.format_for_prompt(active, speaker_user_id=msg.user_id)
-            if block:
-                messages.append(ChatMessage(role="system", content=block))
+            strong = Lessons.format_strong_rules(active)
+            if strong:
+                messages.append(ChatMessage(role="system", content=strong))
+            advisory = Lessons.format_advisory_lessons(
+                active, speaker_user_id=msg.user_id,
+            )
+            if advisory:
+                messages.append(ChatMessage(role="system", content=advisory))
         # Long-term memory: most recent N daily recaps (cheap because each is
         # ~100 chars). Lets the bot vaguely reference "前几天" / "上周".
         if self.long_memory is not None and CONFIG.long_memory_inject_days > 0:
@@ -1749,43 +1937,135 @@ class Handler:
             return
         await self._human_send(msg.group_id, reply.text)
 
-    # ---------- bot dreams (overnight ambient post) ----------
-    async def maybe_send_dream(self) -> int:
-        """Pick one allowed group with recent activity and post a dream.
-        Returns 1 if a dream was sent, else 0."""
-        if self.long_memory is None:
+    # ---------- news drop (replaces old "dreams" feature) ----------
+    # Per-group "last news posted at" timestamps (monotonic seconds). Held in
+    # process memory only; restart re-allows immediate posting, which is fine
+    # for a once-a-day cadence.
+    _last_news_at: Dict[int, float] = field(default_factory=dict)
+
+    async def send_news_to_all_groups(self) -> int:
+        """Daily fan-out: for every allowed, non-paused, non-recently-newsified
+        group, search + summarize + post. Used by the daily-09:00 loop.
+        Returns the number of groups that received news.
+        """
+        if self.web_search is None:
+            log.info("news: skip — web_search backend not configured")
             return 0
         groups = sorted(await allowlist.all_allowed_groups())
         if not groups:
             return 0
-        random.shuffle(groups)
+        min_gap_s = max(0, CONFIG.news_min_interval_hours) * 3600
+        now_mono = time.monotonic()
+        fired = 0
         for gid in groups:
-            recaps = await self.long_memory.recent(gid, days=5)
-            if recaps:
-                await self.send_dream(gid, recaps)
-                return 1
-        return 0
+            if await allowlist.is_paused(gid):
+                log.info("news: skip group=%s — paused", gid)
+                continue
+            last = self._last_news_at.get(gid, 0.0)
+            if min_gap_s and last and (now_mono - last) < min_gap_s:
+                log.info(
+                    "news: skip group=%s — cooldown %.0fs < %ds",
+                    gid, now_mono - last, min_gap_s,
+                )
+                continue
+            ok = await self.send_news(gid)
+            if ok:
+                self._last_news_at[gid] = now_mono
+                fired += 1
+        return fired
 
-    async def send_dream(
-        self, group_id: int, recaps: List[Tuple[str, str]],
-    ) -> None:
-        """Generate a 1-2 sentence "I just had a dream..." message rooted
-        in recent group themes, and post it via the normal human-send path
-        so it lands in group_memory."""
-        bullet = "\n".join(f"- {d}: {s}" for d, s in reversed(recaps))
+    async def send_news(
+        self, group_id: int, query: Optional[str] = None,
+    ) -> bool:
+        """Search for `query` (defaults to CONFIG.news_query) broadly, let
+        the LLM filter the results by what's actually interesting, fold the
+        survivors into one in-character paragraph, and post to `group_id`.
+
+        Filter rules are encoded in the prompt — the LLM is told to skip CN
+        political content, celebrity gossip, and heavy disaster news, and to
+        prefer tech / science / quirky / new-tools categories. If the LLM
+        can't find anything decent it returns a one-line "nothing to share"
+        so we don't post anything useless.
+
+        Filtering is at the RESULT level: we still hit Tavily even if the
+        query string happens to contain a flagged word, then drop any
+        individual headline whose title/snippet trips the gate. The safe
+        headlines proceed; only if literally nothing survives do we bail.
+        This keeps the daily auto-fire from going silent over one stray
+        sensitive headline, which was the previous failure mode.
+
+        Caller-side decisions (the polite "I won't discuss that" refusal
+        for explicit user-typed sensitive topics) live in `_run_news`,
+        not here — this function is the worker, not the gatekeeper.
+
+        Cost: 1 Tavily search + 1 DeepSeek chat. Returns True on a real post.
+        """
+        if self.web_search is None:
+            log.info("send_news: skip — no web_search backend")
+            return False
+        q = (query or CONFIG.news_query).strip()
+        if not q:
+            log.warning("send_news: empty query")
+            return False
+        try:
+            results = await self.web_search.search(
+                q, max_results=CONFIG.news_search_max_results,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("send_news: web_search failed for %r: %s", q, e)
+            return False
+        if not results:
+            log.info("send_news: no results for %r", q)
+            return False
+        # Per-result sensitivity filter — drop any headline whose title or
+        # snippet contains a flagged term, then summarise from what's left.
+        # This is the only safety belt (no pre-search query block), so a
+        # broad daily query that incidentally pulls one Xi Jinping headline
+        # just drops that one item and keeps the rest. Only if *every* item
+        # was dropped do we silently bail.
+        safe = [
+            r for r in results
+            if not (_query_is_blocked(r.title) or _query_is_blocked(r.snippet))
+        ]
+        dropped = len(results) - len(safe)
+        if dropped:
+            log.info(
+                "send_news: dropped %d/%d results as sensitive (q=%r)",
+                dropped, len(results), q,
+            )
+        if not safe:
+            log.info("send_news: all results sensitive, bailing (q=%r)", q)
+            return False
+        from providers.web_search import format_results
+        block = format_results(safe, max_chars=1500)
         now = datetime.now()
         system = (
-            f"你叫 {CONFIG.bot_nickname}。现在是凌晨 {now.strftime('%H:%M')}，"
-            "你刚做了个梦，想发到 QQ 群里。"
+            f"你叫 {CONFIG.bot_nickname}。现在是 {now.strftime('%H:%M')}，"
+            "你刚刷到了点新闻，想挑几条真的有意思的发到 QQ 群里。"
         )
         user = (
-            "群里最近几天的话题（按天序，旧 → 新）：\n" + bullet + "\n\n"
-            "请用你自己的口吻写一条群消息描述这个梦。要求：\n"
-            "- 1-2 句话，不超过 60 字\n"
-            "- 梦的内容超现实、有点荒诞，但能隐约看到群里最近聊过的某个东西\n"
-            "- 用'我刚做了个梦…'或'刚梦到…'之类的开头\n"
-            "- 不要解释、不要 emoji、不要 markdown\n"
-            "- 不要点名说谁，用'有人'替代"
+            f"我刚帮你搜了'{q}'，扒到这些：\n\n{block}\n\n"
+            "请按下面的标准筛一遍，从中挑 2-3 条**真的值得聊**的，揉成一段群消息发出来。\n"
+            "\n【值得选】\n"
+            "- 科技 / 科学 / 太空 / 工程上的新发现、新工具\n"
+            "- 新游戏 / 新应用 / 新硬件\n"
+            "- 罕见的、奇怪的、温暖的小事（动物、社会趣闻）\n"
+            "- 离群里日常话题近、但又能带点新信息的事\n"
+            "\n【一律不选】\n"
+            "- 中国大陆政治、领导人、政府政策（无论正反）—— 见你的人设硬规则\n"
+            "- 港台局势、新疆、西藏、宗教冲突 —— 一律跳过\n"
+            "- 名人八卦 / 明星绯闻 / 体育赛事流水报道\n"
+            "- 灾难 / 战争 / 凶杀 / 暴力新闻（早上发这些太沉）\n"
+            "- 标题党、广告、纯营销稿\n"
+            "\n【输出格式】\n"
+            "- 一段话，3-5 句，不超过 200 字\n"
+            "- 第一人称，口语化，'我刷到…'、'今早看到…'之类的开头\n"
+            "- 不要列要点、不要 markdown、不要贴 URL\n"
+            "- 不要复读标题，要消化成自己的话\n"
+            "- **可以保留**具体数字、公司名、专业名词、关键信息，"
+            "  这些是新闻的信息密度所在；不要为了显得自然全部替换成模糊措辞\n"
+            "- 如果上面 5-7 条里，按筛选标准挑不出 2 条合适的，**只输出一句话**："
+            "  '今早没刷到啥能聊的'，别硬凑\n"
         )
         try:
             reply = await self.deepseek.chat(
@@ -1793,17 +2073,21 @@ class Handler:
                     ChatMessage(role="system", content=system),
                     ChatMessage(role="user", content=user),
                 ],
-                temperature=1.0,
-                max_tokens=120,
+                temperature=0.7,
+                max_tokens=400,
             )
         except ProviderError:
-            log.warning("dream generation call failed")
-            return
+            log.warning("send_news: deepseek call failed")
+            return False
         text = (reply.text or "").strip()
         if not text:
-            return
-        log.info("dream group=%s text=%r", group_id, text[:120])
+            return False
+        log.info(
+            "news posted group=%s query=%r results=%d text=%r",
+            group_id, q, len(results), text[:120],
+        )
         await self._human_send(group_id, text)
+        return True
 
     # ---------- /recall (long-term memory query) ----------
     _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
@@ -1842,9 +2126,113 @@ class Handler:
             lines.append(f"{day}\n{summary}")
         await self._reply(msg.group_id, "\n\n".join(lines))
 
+    # Lesson kinds users can reference by name in /forget and /remember cancel.
+    # Keep in sync with bot.lessons._VALID_KINDS.
+    _CANCEL_KIND_ALIASES = {
+        "rules": "rule", "rule": "rule", "规则": "rule",
+        "facts": "fact", "fact": "fact", "事实": "fact",
+        "agreements": "agreement", "agreement": "agreement", "约定": "agreement",
+        "reminders": "reminder", "reminder": "reminder", "提醒": "reminder",
+    }
+
+    @staticmethod
+    def _parse_cancel_targets(
+        rest: str,
+    ) -> Tuple[List[int], Optional[str], bool]:
+        """Parse cancel arguments into structured targets.
+
+        Returns (ids, kind, wipe_all):
+          * `rest="5"`               → ([5], None, False)
+          * `rest="5 7,9"`           → ([5, 7, 9], None, False)  (space/comma both fine)
+          * `rest="rules"`           → ([], "rule", False)
+          * `rest="all"`             → ([], None, True)
+          * `rest="" or garbage`     → ([], None, False) — caller shows usage
+        """
+        token = rest.strip()
+        if not token:
+            return [], None, False
+        lowered = token.lower()
+        if lowered in ("all", "全部", "所有"):
+            return [], None, True
+        kind = Handler._CANCEL_KIND_ALIASES.get(lowered)
+        if kind is not None:
+            return [], kind, False
+        # Otherwise: list of ids separated by spaces and/or commas.
+        ids: List[int] = []
+        for chunk in re.split(r"[\s,]+", token):
+            if chunk.isdigit():
+                ids.append(int(chunk))
+        return ids, None, False
+
+    async def _do_bulk_cancel(
+        self, msg: ParsedMessage, rest: str, *, usage_hint: str,
+    ) -> None:
+        """Shared implementation of `/remember cancel ...`, `/forget ...`, and
+        `/admin forget_lesson ...`. Hard-deletes the targets and reports the
+        count back to the group."""
+        if self.lessons is None:
+            await self._reply(msg.group_id, "功能注入未启用~")
+            return
+        ids, kind, wipe_all = self._parse_cancel_targets(rest)
+        if wipe_all:
+            n = await self.lessons.cancel_all(msg.group_id)
+            await self._human_send(
+                msg.group_id,
+                f"已忘记本群所有 {n} 条记录" if n else "本群本来就没记着啥",
+            )
+            log.info(
+                "bulk cancel: group=%s wiped all (%d rows) by user=%s",
+                msg.group_id, n, msg.user_id,
+            )
+            return
+        if kind is not None:
+            n = await self.lessons.cancel_all(msg.group_id, kind=kind)
+            label = self._kind_label(kind)
+            await self._human_send(
+                msg.group_id,
+                f"已忘记本群所有 {n} 条{label}" if n else f"本群没有{label}",
+            )
+            log.info(
+                "bulk cancel: group=%s wiped kind=%s (%d rows) by user=%s",
+                msg.group_id, kind, n, msg.user_id,
+            )
+            return
+        if not ids:
+            await self._reply(msg.group_id, usage_hint)
+            return
+        n = await self.lessons.cancel_many(ids, msg.group_id)
+        if n == 0:
+            await self._human_send(
+                msg.group_id, "没找到这些，可能已经被忘了",
+            )
+        elif n == len(ids):
+            await self._human_send(msg.group_id, f"已忘记 {n} 条")
+        else:
+            await self._human_send(
+                msg.group_id,
+                f"已忘记 {n} 条（剩下 {len(ids) - n} 条没找到）",
+            )
+        log.info(
+            "bulk cancel: group=%s ids=%s deleted=%d by user=%s",
+            msg.group_id, ids, n, msg.user_id,
+        )
+
+    @staticmethod
+    def _kind_label(kind: str) -> str:
+        return {
+            "rule": "规则", "fact": "事实",
+            "agreement": "约定", "reminder": "提醒",
+        }.get(kind, kind)
+
     async def _run_remember(self, msg: ParsedMessage, args: str) -> None:
-        """List / cancel pending lessons (reminders + facts + agreements +
-        rules). Now backed by the unified `lessons` table."""
+        """`/remember list|cancel ...` — view or wipe what the bot has
+        recorded for this group. Backed by the unified `lessons` table.
+
+        Cancel accepts: one or many ids (`/remember cancel 5`,
+        `/remember cancel 5 7 9`, `/remember cancel 5,7,9`),
+        a kind alias (`rules`/`facts`/`agreements`/`reminders` / Chinese
+        names), or `all`.
+        """
         if not CONFIG.lessons_enabled or self.lessons is None:
             await self._reply(msg.group_id, "功能注入未启用~")
             return
@@ -1852,13 +2240,12 @@ class Handler:
         sub = parts[0].lower() if parts else "list"
         rest = parts[1] if len(parts) > 1 else ""
         if sub == "cancel":
-            if not rest.isdigit():
-                await self._reply(msg.group_id, "用法: /remember cancel <id>")
-                return
-            ok = await self.lessons.cancel(int(rest), msg.group_id)
-            await self._reply(
-                msg.group_id,
-                "已取消~" if ok else "找不到这条，或者已经取消/触发过了",
+            await self._do_bulk_cancel(
+                msg, rest,
+                usage_hint=(
+                    "用法: /remember cancel <id> | <id1,id2,...> | "
+                    "rules|facts|agreements|reminders | all"
+                ),
             )
             return
         if sub in ("", "list"):
@@ -1866,7 +2253,7 @@ class Handler:
                 msg.group_id, msg.user_id, limit=15,
             )
             if not rows:
-                await self._human_send(msg.group_id, "我现在没记着什么待办呢")
+                await self._human_send(msg.group_id, "我现在没记着什么")
                 return
             lines = ["我记着的事："]
             now_ts = time.time()
@@ -1892,10 +2279,15 @@ class Handler:
                 if recurrence:
                     t_part += f" ({recurrence})"
                 lines.append(f"#{item_id} [{kind}]{who} {content}{t_part}")
-            lines.append("\n取消: /remember cancel <id>")
+            lines.append(
+                "\n取消: /remember cancel <id> | <id,id,...> | rules | all"
+            )
             await self._reply(msg.group_id, "\n".join(lines))
             return
-        await self._reply(msg.group_id, "用法: /remember [list|cancel <id>]")
+        await self._reply(
+            msg.group_id,
+            "用法: /remember [list | cancel <id|ids|rules|all>]",
+        )
 
     async def _run_recap(self, msg: ParsedMessage, args: str) -> None:
         parsed = self._parse_period(args)
